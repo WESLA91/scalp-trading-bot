@@ -5,3 +5,4 @@ requests
 gspread
 google-auth
 tradingview-ta
+tzdata
