@@ -10,10 +10,13 @@
 #  Comandi Telegram (risposta immediata, thread dedicato):
 #  /help /winrate /trend /stats /stato /prezzi /bankroll /scan /ping /restart
 #
-#  Ciclo ogni 15 min: la C valuta ogni candela M15 chiusa,
-#  A e B vengono valutate solo quando chiude una nuova candela H1.
+#  Ciclo allineato alle chiusure candela M15 (:00 :15 :30 :45, +45s
+#  buffer dati): la C valuta ogni candela M15 chiusa, A e B solo
+#  quando arriva una nuova candela H1 (con retry se Yahoo ritarda).
 #  Gli esiti di TUTTI i segnali sono verificati sui dati M15
-#  (piu' precisi del worst-case su H1).
+#  (piu' precisi del worst-case su H1). Notifica quando TP1 sposta
+#  lo SL a breakeven. Lo stato ha backup nella tab "Stato" del
+#  foglio Google: sopravvive ai redeploy Railway (filesystem effimero).
 #
 #  Ogni segnale e' etichettato 🅰️ 🅱️ 🅲 cosi' decidi quanto rischiare.
 #  Il foglio Google traccia esiti e bankroll PER CONFIG e PER ASSET.
@@ -46,7 +49,10 @@ CHAT_ID          = os.environ.get("CHAT_ID", "933030689")
 FILE_CREDENZIALI = "credenziali_trading.json"
 NOME_FOGLIO      = os.environ.get("NOME_FOGLIO", "SCALP Trading")
 FILE_STATO       = "stato_scalp.json"
-CICLO_SECONDI    = int(os.environ.get("CICLO_SECONDI", "900"))   # 15 min
+# Se CICLO_SECONDI e' impostato su Railway usa quello; altrimenti il
+# ciclo si allinea da solo alle chiusure candela M15 (:00 :15 :30 :45).
+CICLO_FISSO      = os.environ.get("CICLO_SECONDI")
+BUFFER_DATI_SEC  = 45   # attesa dopo la chiusura: Yahoo pubblica con ritardo
 
 COPPIE = {
     "EUR/USD": "EURUSD=X",
@@ -113,31 +119,66 @@ VALUTE = {               # per l'avviso news
 
 # ------------------- TELEGRAM -------------------
 def manda_messaggio(testo):
-    try:
-        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": testo}, timeout=15)
-    except Exception as e:
-        print(f"Telegram errore: {e}")
+    """Invio con retry e spezzatura (limite Telegram: 4096 caratteri)."""
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    pezzi = [testo[i:i + 4000] for i in range(0, len(testo), 4000)] or [""]
+    for pezzo in pezzi:
+        for tentativo in (1, 2):
+            try:
+                r = requests.post(url, data={"chat_id": CHAT_ID,
+                                             "text": pezzo}, timeout=15)
+                if r.status_code == 200:
+                    break
+                print(f"Telegram HTTP {r.status_code} "
+                      f"(tentativo {tentativo}/2)")
+            except Exception as e:
+                print(f"Telegram errore (tentativo {tentativo}/2): {e}")
+            time.sleep(2)
 
 
 # ------------------- STATO -------------------
-def carica_stato():
+# Railway ha filesystem EFFIMERO: il file locale sparisce ad ogni
+# deploy/riavvio. Backup su una tab "Stato" del foglio Google, cosi'
+# i segnali aperti sopravvivono e vengono chiusi correttamente.
+def carica_stato(sh=None):
     if os.path.exists(FILE_STATO):
         try:
             with open(FILE_STATO) as f:
                 return json.load(f)
         except Exception:
             pass
+    if sh is not None:
+        try:
+            val = sh.worksheet("Stato").acell("A1").value
+            if val:
+                stato = json.loads(val)
+                stato.setdefault("segnali", [])
+                stato.setdefault("gia_segnalati", [])
+                print("Stato ripristinato dal backup su Google Sheets.")
+                return stato
+        except Exception as e:
+            print(f"Nessun backup stato su Sheets: {e}")
     return {"segnali": [], "gia_segnalati": []}
 
 
-def salva_stato(stato):
+def salva_stato(stato, sh=None):
     try:
         stato["gia_segnalati"] = stato["gia_segnalati"][-400:]
         with open(FILE_STATO, "w") as f:
             json.dump(stato, f, indent=1)
     except Exception as e:
         print(f"Errore salvataggio stato: {e}")
+    if sh is not None:
+        try:
+            blob = json.dumps(stato)
+            if len(blob) > 49000:      # limite 50k caratteri per cella
+                ridotto = dict(stato)
+                ridotto["gia_segnalati"] = stato["gia_segnalati"][-150:]
+                blob = json.dumps(ridotto)
+            sh.worksheet("Stato").update(values=[[blob]],
+                                         range_name="A1")
+        except Exception as e:
+            print(f"Backup stato su Sheets fallito: {e}")
 
 
 # ------------------- GOOGLE SHEETS -------------------
@@ -166,6 +207,8 @@ def apri_foglio():
             ws.append_row(HEADER_SEGNALI)
         if "Bankroll" not in titoli:
             sh.add_worksheet("Bankroll", rows=60, cols=8)
+        if "Stato" not in titoli:
+            sh.add_worksheet("Stato", rows=2, cols=1)   # backup stato bot
         return sh
     except Exception as e:
         print(f"Google Sheets non disponibile: {e}")
@@ -194,7 +237,10 @@ def sheet_chiudi_segnale(sh, seg, esito, r, quando):
         ws = sh.worksheet("Segnali")
         riga = seg.get("riga_sheet")
         if riga:
-            ws.update(f"J{riga}:L{riga}", [[esito, r, quando]])
+            # argomenti con nome: in gspread 6.x l'ordine posizionale
+            # (range, valori) e' deprecato e verra' rimosso
+            ws.update(values=[[esito, r, quando]],
+                      range_name=f"J{riga}:L{riga}")
         else:
             ws.append_row([seg["id"], seg["config"], seg["apertura"], seg["asset"],
                            seg["dir"], seg["entrata"], seg["sl"], seg["tp1"],
@@ -245,7 +291,8 @@ def sheet_ricalcola_bankroll(sh):
                       datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")])
         ws = sh.worksheet("Bankroll")
         ws.clear()
-        ws.update("A1", righe, value_input_option="USER_ENTERED")
+        ws.update(values=righe, range_name="A1",
+                  value_input_option="USER_ENTERED")
     except Exception as e:
         print(f"Sheets errore (bankroll): {e}")
 
@@ -309,8 +356,18 @@ def rsi_wilder(close, periodo=14):
 
 
 def scarica_dati(ticker, intervallo="1h"):
-    df = yf.download(ticker, interval=intervallo, period="60d",
-                     progress=False, auto_adjust=False)
+    df = None
+    for tentativo in range(2):        # 1 retry sui fallimenti transitori
+        try:
+            df = yf.download(ticker, interval=intervallo, period="60d",
+                             progress=False, auto_adjust=False)
+        except Exception as e:
+            print(f"yfinance errore {ticker} ({intervallo}): {e}")
+            df = None
+        if df is not None and not df.empty:
+            break
+        if tentativo == 0:
+            time.sleep(3)
     if df is None or df.empty:
         return None
     if isinstance(df.columns, pd.MultiIndex):
@@ -486,12 +543,13 @@ TESTO_HELP = (
     "/restart — riavvia il bot (torna su in ~20 secondi)\n"
     "━━━━━━━━━━━━━━━\n"
     f"🅰️ Qualita' H1  🅱️ Diversificazione H1  🅲 Sperimentale M15\n"
-    f"🕐 Sessione {ORA_INIZIO_ITA:02d}-{ORA_FINE_ITA} ITA | Ciclo automatico 15 min"
+    f"🕐 Sessione {ORA_INIZIO_ITA:02d}-{ORA_FINE_ITA} ITA | "
+    "Ciclo automatico a ogni chiusura M15"
 )
 
 
 def cmd_stato(stato):
-    aperti = stato.get("segnali", [])
+    aperti = list(stato.get("segnali", []))   # copia: letta da altro thread
     if not aperti:
         return "📭 Nessun segnale aperto al momento."
     righe = [f"📌 SEGNALI APERTI: {len(aperti)}", "━━━━━━━━━━━━━━━"]
@@ -682,7 +740,7 @@ def cmd_restart():
 
 
 def gestisci_comando(testo, stato, cont):
-    t = testo.strip().lower().split("@")[0]
+    t = (testo or "").strip().lower().split("@")[0]
     if t in ("/help", "/start"):
         return TESTO_HELP
     if t == "/winrate":
@@ -691,8 +749,6 @@ def gestisci_comando(testo, stato, cont):
         return cmd_trend()
     if t == "/stats":
         return cmd_stats(cont, stato)
-    if t == "/restart":
-        cmd_restart()          # non ritorna: il processo esce
     if t == "/stato":
         return cmd_stato(stato)
     if t == "/prezzi":
@@ -700,6 +756,7 @@ def gestisci_comando(testo, stato, cont):
     if t == "/bankroll":
         return cmd_bankroll(cont)
     if t == "/scan":
+        stato.setdefault("ultima_h1", {}).clear()  # forza anche l'analisi H1
         EVENTO_SCAN.set()
         return "🔄 Ciclo di analisi forzato: parte ora, risultati in arrivo."
     if t == "/ping":
@@ -712,17 +769,28 @@ def gestisci_comando(testo, stato, cont):
 
 def ascolta_comandi(stato, cont):
     offset = 0
+    url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
     while True:
         try:
-            r = requests.get(
-                f"https://api.telegram.org/bot{TOKEN}/getUpdates",
-                params={"timeout": 50, "offset": offset}, timeout=60)
+            r = requests.get(url, params={"timeout": 50, "offset": offset},
+                             timeout=60)
             for up in r.json().get("result", []):
                 offset = up["update_id"] + 1
                 msg = up.get("message") or {}
                 if str((msg.get("chat") or {}).get("id", "")) != str(CHAT_ID):
                     continue          # ignora chiunque non sia Mirko
-                risposta = gestisci_comando(msg.get("text", ""), stato, cont)
+                testo = (msg.get("text") or "").strip()
+                if testo.lower().split("@")[0] == "/restart":
+                    # CRITICO: confermare l'update PRIMA di uscire,
+                    # altrimenti Telegram lo riconsegna al riavvio
+                    # -> loop infinito di riavvii
+                    try:
+                        requests.get(url, params={"offset": offset,
+                                                  "timeout": 0}, timeout=10)
+                    except Exception:
+                        pass
+                    cmd_restart()     # non ritorna: il processo esce
+                risposta = gestisci_comando(testo, stato, cont)
                 if risposta:
                     manda_messaggio(risposta)
         except Exception as e:
@@ -740,21 +808,30 @@ def ciclo(stato, sh):
                 print(f"{nome}: dati M15 non disponibili")
                 continue
 
-            # H1: scaricato solo se e' chiusa una nuova candela H1
-            # rispetto all'ultima gia' processata per questo asset
+            # H1: riscaricato solo quando dovrebbe esistere una nuova
+            # candela chiusa. Il marcatore e' la candela REALE ricevuta:
+            # se Yahoo e' in ritardo non si marca nulla e si ritenta al
+            # ciclo dopo (prima si perdeva l'intera ora di analisi A/B).
             df_h1 = None
-            ultima_h1 = stato.setdefault("ultima_h1", {}).get(nome)
-            ora_chiusa = datetime.now(timezone.utc).replace(
-                minute=0, second=0, microsecond=0).isoformat()
-            if ultima_h1 != ora_chiusa:
+            marcatori = stato.setdefault("ultima_h1", {})
+            ultimo = marcatori.get(nome)
+            attesa = (datetime.now(timezone.utc).replace(
+                minute=0, second=0, microsecond=0)
+                - pd.Timedelta(hours=1))   # apertura ultima H1 chiusa attesa
+            if ultimo is None or pd.Timestamp(ultimo) < attesa:
                 df_h1 = scarica_dati(ticker, "1h")
-                if df_h1 is not None:
-                    stato["ultima_h1"][nome] = ora_chiusa
                 time.sleep(2)          # gentilezza verso Yahoo
+                if df_h1 is not None:
+                    nuova = df_h1.index[-1]
+                    if ultimo is not None and pd.Timestamp(ultimo) >= nuova:
+                        df_h1 = None   # dati non aggiornati: ritento dopo
+                    else:
+                        marcatori[nome] = nuova.isoformat()
 
             # 1) esiti dei segnali aperti (tutte le config, dati M15:
             #    piu' granulari = worst-case piu' fedele anche per A e B)
             for seg in [s for s in stato["segnali"] if s["asset"] == nome]:
+                fase_prima = seg.get("fase")
                 ris = verifica_esito(seg, df_m15)
                 if ris:
                     esito, ts = ris
@@ -763,11 +840,16 @@ def ciclo(stato, sh):
                     sheet_chiudi_segnale(sh, seg, esito, r,
                                          ts.strftime("%Y-%m-%d %H:%M"))
                     stato["segnali"].remove(seg)
-                    salva_stato(stato)
+                    salva_stato(stato, sh)
                     sheet_ricalcola_bankroll(sh)
                     print(f"{nome} [{seg['config']}]: chiuso -> {esito} ({r:+.1f}R)")
-                else:
-                    salva_stato(stato)
+                elif seg.get("fase") != fase_prima:
+                    # TP1 raggiunto: SL spostato a breakeven -> persisto
+                    manda_messaggio(f"🟡 {CONFIGS[seg['config']]['emoji']} "
+                                    f"TP1 raggiunto — {seg['asset']} "
+                                    f"{seg['dir']}: SL a breakeven\n"
+                                    f"🆔 {seg['id']}")
+                    salva_stato(stato, sh)
 
             # 2) nuovi segnali: una posizione per asset PER CONFIG
             for cid, cfg in CONFIGS.items():
@@ -786,7 +868,7 @@ def ciclo(stato, sh):
                 seg["riga_sheet"] = sheet_aggiungi_segnale(sh, seg)
                 stato["segnali"].append(seg)
                 stato["gia_segnalati"].append(seg["chiave"])
-                salva_stato(stato)
+                salva_stato(stato, sh)
                 print(f"{nome} [{cid}]: NUOVO SEGNALE {seg['dir']} ({seg['id']})")
 
             p = float(df_m15["Close"].iloc[-1])
@@ -799,10 +881,21 @@ def ciclo(stato, sh):
             print(f"❌ Errore {nome}: {e}")
 
 
+def attesa_prossimo_ciclo():
+    """Secondi fino alla prossima chiusura M15 + buffer dati Yahoo.
+    Cosi' il ciclo parte ~45s dopo ogni :00 :15 :30 :45 e i segnali
+    arrivano subito, non fino a 15 minuti dopo."""
+    if CICLO_FISSO:
+        return int(CICLO_FISSO)
+    ora = datetime.now(timezone.utc)
+    passati = (ora.minute % 15) * 60 + ora.second
+    return (900 - passati) + BUFFER_DATI_SEC
+
+
 def main():
-    stato = carica_stato()
     sh = apri_foglio()
-    cont = {"sh": sh}     # contenitore condiviso col thread comandi
+    stato = carica_stato(sh)   # il foglio serve PRIMA: ripristino backup
+    cont = {"sh": sh}          # contenitore condiviso col thread comandi
     threading.Thread(target=ascolta_comandi, args=(stato, cont),
                      daemon=True).start()
     manda_messaggio(
@@ -811,19 +904,26 @@ def main():
         f"🅲 Sperimentale M15 (pivot 5, EMA200) — forward test\n"
         f"📊 Asset: {', '.join(COPPIE)}\n"
         f"🕐 Sessione {ORA_INIZIO_ITA:02d}-{ORA_FINE_ITA} ITA | "
-        "Solo candele chiuse | Ciclo 15 min\n"
+        "Solo candele chiuse | Ciclo a ogni chiusura M15\n"
         f"📄 Google Sheets: {'attivo ✅' if sh else 'NON attivo ⚠️'}\n"
         f"📌 Segnali aperti ripristinati: {len(stato['segnali'])}\n"
         "💬 Scrivi /help per i comandi"
     )
     print("Bot V15 avviato.")
     while True:
-        print(f"\n--- CICLO {datetime.now(timezone.utc).strftime('%H:%M UTC')} ---")
-        ciclo(stato, cont["sh"])
-        if cont["sh"] is None:
-            cont["sh"] = apri_foglio()
-        print(f"--- attendo {CICLO_SECONDI // 60} minuti (o /scan) ---")
-        EVENTO_SCAN.wait(timeout=CICLO_SECONDI)  # /scan interrompe l'attesa
+        try:
+            print(f"\n--- CICLO "
+                  f"{datetime.now(timezone.utc).strftime('%H:%M UTC')} ---")
+            ciclo(stato, cont["sh"])
+            if cont["sh"] is None:
+                cont["sh"] = apri_foglio()
+        except Exception as e:
+            # un errore imprevisto non deve uccidere il processo
+            print(f"❌ Errore ciclo (continuo): {e}")
+        secondi = attesa_prossimo_ciclo()
+        print(f"--- prossimo ciclo tra {secondi // 60}m{secondi % 60:02d}s "
+              "(o /scan) ---")
+        EVENTO_SCAN.wait(timeout=secondi)  # /scan interrompe l'attesa
         EVENTO_SCAN.clear()
 
 
