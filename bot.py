@@ -527,6 +527,7 @@ def msg_esito(seg, esito, r):
 # Thread separato in long polling: risponde SUBITO, indipendente
 # dal ciclo di scansione. /scan sveglia il ciclo all'istante.
 EVENTO_SCAN = threading.Event()
+SCAN_MANUALE = threading.Event()   # /scan: a fine ciclo manda un riepilogo
 
 TESTO_HELP = (
     "📖 COMANDI DISPONIBILI\n"
@@ -757,8 +758,10 @@ def gestisci_comando(testo, stato, cont):
         return cmd_bankroll(cont)
     if t == "/scan":
         stato.setdefault("ultima_h1", {}).clear()  # forza anche l'analisi H1
+        SCAN_MANUALE.set()
         EVENTO_SCAN.set()
-        return "🔄 Ciclo di analisi forzato: parte ora, risultati in arrivo."
+        return ("🔄 Ciclo forzato in corso... a fine analisi ti mando "
+                "un riepilogo (anche se non trovo segnali).")
     if t == "/ping":
         adesso = datetime.now(TZ_ITA).strftime("%H:%M:%S")
         return f"🏓 Vivo! Ora italiana: {adesso}"
@@ -914,12 +917,30 @@ def main():
         try:
             print(f"\n--- CICLO "
                   f"{datetime.now(timezone.utc).strftime('%H:%M UTC')} ---")
+            prima = len(stato["segnali"])
             ciclo(stato, cont["sh"])
             if cont["sh"] is None:
                 cont["sh"] = apri_foglio()
+            if SCAN_MANUALE.is_set():
+                SCAN_MANUALE.clear()
+                nuovi = len(stato["segnali"]) - prima
+                ora_ita = datetime.now(TZ_ITA)
+                in_sessione = (ora_ita.weekday() < 5 and
+                               ORA_INIZIO_ITA <= ora_ita.hour < ORA_FINE_ITA)
+                extra = ("" if in_sessione else
+                         "\n⚠️ Fuori sessione (07-19 ITA, lun-ven): "
+                         "nuovi segnali disattivati, verifico solo gli esiti.")
+                manda_messaggio(
+                    f"✅ Scan completato: {len(COPPIE)} asset analizzati "
+                    f"su M15 e H1.\n"
+                    f"🆕 Nuovi segnali trovati: {max(nuovi, 0)}\n"
+                    f"📌 Segnali aperti: {len(stato['segnali'])}{extra}")
         except Exception as e:
             # un errore imprevisto non deve uccidere il processo
             print(f"❌ Errore ciclo (continuo): {e}")
+            if SCAN_MANUALE.is_set():
+                SCAN_MANUALE.clear()
+                manda_messaggio(f"⚠️ Scan interrotto da un errore: {e}")
         secondi = attesa_prossimo_ciclo()
         print(f"--- prossimo ciclo tra {secondi // 60}m{secondi % 60:02d}s "
               "(o /scan) ---")
