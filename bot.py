@@ -61,9 +61,12 @@ COPPIE = {
     "GBP/JPY": "GBPJPY=X",
 }
 
-# --------- LE TRE STRATEGIE ---------
-# A e B: validate da ottimizza.py su H1 (128 config, split temporale).
-# C: sperimentale su M15, parametri prudenti NON ancora ottimizzati.
+# --------- LE STRATEGIE ---------
+# A e B: trade automatici validati da ottimizza.py su H1.
+# D: SEGNALATORE di inversione su M15 (metodo Mirko: BOS + Fib 0.886).
+#    Il bot rileva il cambio di struttura e AVVISA: la valutazione e
+#    l'eventuale entrata col pendente sono MANUALI. Nessun trade
+#    automatico, nessun tracking esiti per la D.
 CONFIGS = {
     "A": {"nome": "Qualita'",         "emoji": "🅰️", "onde": 2, "pivot": 3,
           "fib": 0.50, "rsi_lmax": 70, "rsi_smin": 30, "ema": True,
@@ -71,9 +74,20 @@ CONFIGS = {
     "B": {"nome": "Diversificazione", "emoji": "🅱️", "onde": 2, "pivot": 5,
           "fib": 0.50, "rsi_lmax": 70, "rsi_smin": 30, "ema": False,
           "tf": "1h"},
-    "C": {"nome": "Sperimentale M15", "emoji": "🅲",  "onde": 2, "pivot": 5,
-          "fib": 0.50, "rsi_lmax": 70, "rsi_smin": 30, "ema": True,
-          "tf": "15m"},
+}
+
+# parametri del segnalatore D
+PIVOT_D = 5          # finestra pivot per gli swing su M15
+FIB_D   = 0.886      # livello di riferimento per il pendente
+
+# Coppie dei SEGNALATORI (SCALPING M15 + THE BOAT H4).
+# A/B restano trade automatici SOLO sui 4 asset storici di COPPIE.
+COPPIE_D = {
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/CAD": "USDCAD=X",
+    "XAU/USD": "GC=F",
+    "GBP/JPY": "GBPJPY=X",
 }
 
 SECONDI_TF = {"1h": 3600, "15m": 900}   # durata candela per timeframe
@@ -88,6 +102,14 @@ TP1_R          = 1.0
 TP2_R          = 3.0
 RISCHIO_PCT    = 1.0
 BANKROLL_INIZ  = 1000.0
+
+# --------- FILTRO STOP MINIMO (sanita', non ottimizzazione) ---------
+# Uno stop piu' stretto di poche volte lo spread non e' eseguibile
+# nella realta' (lo spread da solo vale piu' R dello stop). Trade
+# con stop microscopici vengono scartati per TUTTE le strategie.
+SPREAD_TIPICO = {"EUR/USD": 0.00010, "GBP/USD": 0.00015,
+                 "XAU/USD": 0.30, "GBP/JPY": 0.020}
+STOP_MIN_SPREAD = 5.0   # lo stop deve valere almeno 5x lo spread
 
 try:
     import gspread
@@ -400,6 +422,116 @@ def ultimi_pivot(df, finestra):
     return ph[-2], ph[-1], pl[-2], pl[-1]
 
 
+# ------------------- SEGNALATORE D / SCALPING (testa e spalle M15) ---------
+def _comprimi(vals, tieni_minimo=True, tol=0.0005):
+    """Fonde pivot consecutivi quasi identici (entro 0.05%): nelle
+    lateralizzazioni si formano doppi pivot che rompono la geometria
+    spalla-testa-spalla. Tiene il valore piu' estremo."""
+    out = []
+    for v in vals:
+        if out and out[-1] != 0 and abs(v - out[-1]) / abs(out[-1]) < tol:
+            out[-1] = min(out[-1], v) if tieni_minimo else max(out[-1], v)
+        else:
+            out.append(v)
+    return out
+
+
+def pivot_multipli(df, finestra):
+    """Liste complete dei massimi e minimi swing confermati (valori),
+    con compressione dei duplicati consecutivi."""
+    h, l = df["High"].values, df["Low"].values
+    ph, pl = [], []
+    for p in range(finestra, len(df) - finestra):
+        lo, hi = p - finestra, p + finestra + 1
+        if h[p] == h[lo:hi].max():
+            ph.append(h[p])
+        if l[p] == l[lo:hi].min():
+            pl.append(l[p])
+    return _comprimi(ph, tieni_minimo=False), _comprimi(pl, tieni_minimo=True)
+
+
+def h1_a_h4(df_h1):
+    """Costruisce candele H4 aggregando le H1 (Yahoo non ha H4 native).
+    Scarta l'ultima H4 se incompleta (meno di 4 ore dalla sua apertura)."""
+    if df_h1 is None or len(df_h1) < 40:
+        return None
+    df = df_h1[["Open", "High", "Low", "Close"]].resample("4h").agg(
+        {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+    ).dropna()
+    adesso = datetime.now(timezone.utc)
+    if len(df) and (adesso - df.index[-1].to_pydatetime()).total_seconds() < 4 * 3600:
+        df = df.iloc[:-1]                 # H4 ancora in formazione
+    if len(df) < 30:
+        return None
+    df["RSI"] = rsi_wilder(df["Close"])
+    return df
+
+
+def cerca_inversione(nome, df, filtra_sessione=True):
+    """Rileva un TESTA E SPALLE completato sull'ultima candela M15 chiusa.
+    LONG (T&S rovesciato): 3 minimi con la TESTA (centrale) piu' bassa
+    delle due spalle + chiusura sopra l'ultimo massimo (neckline).
+    SHORT (T&S classico): 3 massimi con la testa piu' alta + chiusura
+    sotto l'ultimo minimo. Ritorna info per il messaggio; NON apre trade."""
+    i = len(df) - 1
+    ts_ita = df.index[i].tz_convert(TZ_ITA)
+    if ts_ita.weekday() >= 5:
+        return None
+    if filtra_sessione and not (ORA_INIZIO_ITA <= ts_ita.hour < ORA_FINE_ITA):
+        return None
+    ph, pl = pivot_multipli(df.iloc[:-1], PIVOT_D)   # solo candele chiuse
+    if not ph or not pl:
+        return None
+    chiusura = float(df["Close"].iloc[i])
+    massimo_candela = float(df["High"].iloc[i])
+    minimo_candela = float(df["Low"].iloc[i])
+    rsi = float(df["RSI"].iloc[i])
+
+    # LONG — testa e spalle ROVESCIATO: spalla, testa (minimo assoluto), spalla
+    if len(pl) >= 3:
+        s1, testa, s2 = pl[-3], pl[-2], pl[-1]
+        neckline = ph[-1]                 # ultimo massimo confermato
+        if testa < s1 and testa < s2 and chiusura > neckline:
+            gamba_max = max(neckline, massimo_candela)
+            fib = gamba_max - (gamba_max - testa) * FIB_D
+            return {"dir": "LONG", "pattern": "Testa e Spalle rovesciato",
+                    "rotto": neckline, "origine": testa, "spalle": (s1, s2),
+                    "fib886": fib, "rsi": rsi, "ts": df.index[i]}
+
+    # SHORT — testa e spalle CLASSICO: spalla, testa (massimo assoluto), spalla
+    if len(ph) >= 3:
+        s1, testa, s2 = ph[-3], ph[-2], ph[-1]
+        neckline = pl[-1]                 # ultimo minimo confermato
+        if testa > s1 and testa > s2 and chiusura < neckline:
+            gamba_min = min(neckline, minimo_candela)
+            fib = gamba_min + (testa - gamba_min) * FIB_D
+            return {"dir": "SHORT", "pattern": "Testa e Spalle",
+                    "rotto": neckline, "origine": testa, "spalle": (s1, s2),
+                    "fib886": fib, "rsi": rsi, "ts": df.index[i]}
+    return None
+
+
+def msg_inversione(nome, inv, strategia="SCALPING", tf="M15", emoji="🎯"):
+    d = dec(nome)
+    verso = "📈 possibile LONG" if inv["dir"] == "LONG" else "📉 possibile SHORT"
+    dove_stop = ("sotto la testa" if inv["dir"] == "LONG"
+                 else "sopra la testa")
+    return (f"{emoji} {strategia} — {nome} ({tf})\n"
+            f"👤 {inv['pattern']} completato!\n"
+            f"{verso} (inversione)\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"💥 Neckline rotta (in chiusura): {inv['rotto']:.{d}f}\n"
+            f"🗣 Testa ({dove_stop} va lo stop): {inv['origine']:.{d}f}\n"
+            f"💪 Spalle: {inv['spalle'][0]:.{d}f} | {inv['spalle'][1]:.{d}f}\n"
+            f"📐 Fib 0.886 di riferimento: {inv['fib886']:.{d}f}\n"
+            f"📊 RSI {tf}: {inv['rsi']:.1f}\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"👉 Apri il grafico, traccia il fibo e valuta il pendente.\n"
+            f"⚠️ Se fa nuovi estremi, ritraccia il fibo: il livello si aggiorna.\n"
+            f"🕐 Candela {tf} "
+            f"{inv['ts'].tz_convert(TZ_ITA).strftime('%d/%m %H:%M')}")
+
+
 # ------------------- SEGNALE (candela CHIUSA) -------------------
 def cerca_segnale(nome, df, cid):
     cfg = CONFIGS[cid]
@@ -451,6 +583,12 @@ def cerca_segnale(nome, df, cid):
                    "tp2": prezzo - (sl - prezzo) * TP2_R}
     if seg is None:
         return None
+    # stop troppo stretto rispetto allo spread = trade non eseguibile
+    rischio = abs(seg["entrata"] - seg["sl"])
+    if rischio < SPREAD_TIPICO.get(nome, 0) * STOP_MIN_SPREAD:
+        print(f"{nome} [{cid}]: segnale scartato, stop troppo stretto "
+              f"({rischio:.{dec(nome)}f} < {STOP_MIN_SPREAD:.0f}x spread)")
+        return None
     seg.update({
         "asset": nome, "config": cid, "tf": cfg["tf"],
         "apertura": ts.strftime("%Y-%m-%d %H:%M"),
@@ -496,7 +634,7 @@ def dec(nome):
 
 
 def msg_segnale(seg, tv, avvisi):
-    cfg = CONFIGS[seg["config"]]
+    cfg = CONFIGS.get(seg["config"], {"emoji": "❓", "nome": seg["config"]})
     d = dec(seg["asset"])
     e = "🟢" if seg["dir"] == "LONG" else "🔴"
     testo = (f"{e} {cfg['emoji']} SEGNALE {seg['dir']} — {seg['asset']}\n"
@@ -518,7 +656,7 @@ def msg_segnale(seg, tv, avvisi):
 def msg_esito(seg, esito, r):
     icone = {"SL": "❌", "TP1_BE": "🟡", "TP2": "✅"}
     nomi = {"SL": "STOP LOSS", "TP1_BE": "TP1 + Breakeven", "TP2": "TP2 PIENO"}
-    cfg = CONFIGS[seg["config"]]
+    cfg = CONFIGS.get(seg["config"], {"emoji": "❓"})
     return (f"{icone[esito]} {cfg['emoji']} CHIUSO — {seg['asset']} {seg['dir']}\n"
             f"Esito: {nomi[esito]}  ({r:+.1f}R)\n🆔 {seg['id']}")
 
@@ -543,7 +681,9 @@ TESTO_HELP = (
     "/ping — verifica che il bot sia vivo\n"
     "/restart — riavvia il bot (torna su in ~20 secondi)\n"
     "━━━━━━━━━━━━━━━\n"
-    f"🅰️ Qualita' H1  🅱️ Diversificazione H1  🅲 Sperimentale M15\n"
+    f"🅰️ Qualita' H1  🅱️ Diversificazione H1 (trade automatici)\n"
+    f"🎯 SCALPING (M15) e ⛵ THE BOAT (H4): avvisano quando si completa\n"
+    f"    un testa e spalle; l'entrata a 0.886 la valuti TU sul grafico\n"
     f"🕐 Sessione {ORA_INIZIO_ITA:02d}-{ORA_FINE_ITA} ITA | "
     "Ciclo automatico a ogni chiusura M15"
 )
@@ -848,7 +988,7 @@ def ciclo(stato, sh):
                     print(f"{nome} [{seg['config']}]: chiuso -> {esito} ({r:+.1f}R)")
                 elif seg.get("fase") != fase_prima:
                     # TP1 raggiunto: SL spostato a breakeven -> persisto
-                    manda_messaggio(f"🟡 {CONFIGS[seg['config']]['emoji']} "
+                    manda_messaggio(f"🟡 {CONFIGS.get(seg['config'], {}).get('emoji', '❓')} "
                                     f"TP1 raggiunto — {seg['asset']} "
                                     f"{seg['dir']}: SL a breakeven\n"
                                     f"🆔 {seg['id']}")
@@ -874,6 +1014,37 @@ def ciclo(stato, sh):
                 salva_stato(stato, sh)
                 print(f"{nome} [{cid}]: NUOVO SEGNALE {seg['dir']} ({seg['id']})")
 
+            # 3) 🎯 SCALPING: testa e spalle su M15 (solo AVVISO).
+            #    Anti-spam: una sola allerta per pattern.
+            inv = cerca_inversione(nome, df_m15)
+            if inv is not None:
+                chiave_d = (f"D_{nome}_{inv['dir']}_"
+                            f"{inv['origine']:.{dec(nome)}f}")
+                if chiave_d not in stato["gia_segnalati"]:
+                    manda_messaggio(msg_inversione(nome, inv))
+                    stato["gia_segnalati"].append(chiave_d)
+                    salva_stato(stato, sh)
+                    print(f"{nome} [SCALPING]: {inv['pattern']} {inv['dir']}")
+
+            # 4) ⛵ THE BOAT: testa e spalle su H4 (solo AVVISO).
+            #    Valutato quando c'e' un H1 fresco (le H4 derivano dalle H1).
+            if df_h1 is not None:
+                df_h4 = h1_a_h4(df_h1)
+                if df_h4 is not None:
+                    inv_b = cerca_inversione(nome, df_h4,
+                                             filtra_sessione=False)
+                    if inv_b is not None:
+                        chiave_b = (f"BOAT_{nome}_{inv_b['dir']}_"
+                                    f"{inv_b['origine']:.{dec(nome)}f}")
+                        if chiave_b not in stato["gia_segnalati"]:
+                            manda_messaggio(msg_inversione(
+                                nome, inv_b, strategia="THE BOAT",
+                                tf="H4", emoji="⛵"))
+                            stato["gia_segnalati"].append(chiave_b)
+                            salva_stato(stato, sh)
+                            print(f"{nome} [THE BOAT]: "
+                                  f"{inv_b['pattern']} {inv_b['dir']}")
+
             p = float(df_m15["Close"].iloc[-1])
             print(f"{nome}: prezzo {p:.{dec(nome)}f} | "
                   f"RSI M15 {float(df_m15['RSI'].iloc[-1]):.1f} | "
@@ -882,6 +1053,57 @@ def ciclo(stato, sh):
 
         except Exception as e:
             print(f"❌ Errore {nome}: {e}")
+
+    # --- Coppie EXTRA: SCALPING M15 + THE BOAT H4 (solo segnalatori) ---
+    for nome, ticker in COPPIE_D.items():
+        if nome in COPPIE:
+            continue               # gia' analizzata nel loop principale
+        try:
+            df_m15 = scarica_dati(ticker, "15m")
+            if df_m15 is None:
+                continue
+            inv = cerca_inversione(nome, df_m15)
+            if inv is not None:
+                chiave_d = (f"D_{nome}_{inv['dir']}_"
+                            f"{inv['origine']:.{dec(nome)}f}")
+                if chiave_d not in stato["gia_segnalati"]:
+                    manda_messaggio(msg_inversione(nome, inv))
+                    stato["gia_segnalati"].append(chiave_d)
+                    salva_stato(stato, sh)
+                    print(f"{nome} [SCALPING]: {inv['pattern']} {inv['dir']}")
+
+            # THE BOAT: H1 scaricato solo su nuova candela oraria
+            # (stesso marcatore usato per gli asset principali)
+            marcatori = stato.setdefault("ultima_h1", {})
+            ultimo = marcatori.get(nome)
+            attesa = (datetime.now(timezone.utc).replace(
+                minute=0, second=0, microsecond=0)
+                - pd.Timedelta(hours=1))
+            if ultimo is None or pd.Timestamp(ultimo) < attesa:
+                df_h1 = scarica_dati(ticker, "1h")
+                time.sleep(1.5)
+                if df_h1 is not None:
+                    nuova = df_h1.index[-1]
+                    if ultimo is None or pd.Timestamp(ultimo) < nuova:
+                        marcatori[nome] = nuova.isoformat()
+                        df_h4 = h1_a_h4(df_h1)
+                        if df_h4 is not None:
+                            inv_b = cerca_inversione(nome, df_h4,
+                                                     filtra_sessione=False)
+                            if inv_b is not None:
+                                chiave_b = (f"BOAT_{nome}_{inv_b['dir']}_"
+                                            f"{inv_b['origine']:.{dec(nome)}f}")
+                                if chiave_b not in stato["gia_segnalati"]:
+                                    manda_messaggio(msg_inversione(
+                                        nome, inv_b, strategia="THE BOAT",
+                                        tf="H4", emoji="⛵"))
+                                    stato["gia_segnalati"].append(chiave_b)
+                                    salva_stato(stato, sh)
+                                    print(f"{nome} [THE BOAT]: "
+                                          f"{inv_b['pattern']} {inv_b['dir']}")
+            time.sleep(1.5)        # gentilezza verso Yahoo
+        except Exception as e:
+            print(f"❌ Errore segnalatori {nome}: {e}")
 
 
 def attesa_prossimo_ciclo():
@@ -904,7 +1126,7 @@ def main():
     manda_messaggio(
         "🤖 SCALP Bot V15 avviato!\n"
         f"🅰️ Qualita' H1 (pivot 3, EMA200)  |  🅱️ Diversificazione H1 (pivot 5)\n"
-        f"🅲 Sperimentale M15 (pivot 5, EMA200) — forward test\n"
+        f"🎯 SCALPING (M15) + ⛵ THE BOAT (H4): testa e spalle — valuti tu\n"
         f"📊 Asset: {', '.join(COPPIE)}\n"
         f"🕐 Sessione {ORA_INIZIO_ITA:02d}-{ORA_FINE_ITA} ITA | "
         "Solo candele chiuse | Ciclo a ogni chiusura M15\n"
