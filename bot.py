@@ -467,47 +467,104 @@ def h1_a_h4(df_h1):
     return df
 
 
+def _sequenza_estremi(df, finestra):
+    """Ritorna la sequenza ordinata nel tempo di massimi e minimi swing
+    confermati: lista di (indice, prezzo, tipo) con tipo 'H'/'L'.
+    Serve per riconoscere la forma a W (T&S rovesciato) o M (classico)."""
+    h, l = df["High"].values, df["Low"].values
+    estremi = []
+    for p in range(finestra, len(df) - finestra):
+        lo, hi = p - finestra, p + finestra + 1
+        if h[p] == h[lo:hi].max():
+            estremi.append((p, h[p], "H"))
+        if l[p] == l[lo:hi].min():
+            estremi.append((p, l[p], "L"))
+    estremi.sort(key=lambda x: x[0])
+    # comprimo estremi consecutivi dello stesso tipo tenendo il piu' estremo
+    puliti = []
+    for e in estremi:
+        if puliti and puliti[-1][2] == e[2]:
+            if (e[2] == "H" and e[1] > puliti[-1][1]) or \
+               (e[2] == "L" and e[1] < puliti[-1][1]):
+                puliti[-1] = e
+        else:
+            puliti.append(e)
+    return puliti
+
+
 def cerca_inversione(nome, df, filtra_sessione=True):
-    """Rileva un TESTA E SPALLE completato sull'ultima candela M15 chiusa.
-    LONG (T&S rovesciato): 3 minimi con la TESTA (centrale) piu' bassa
-    delle due spalle + chiusura sopra l'ultimo massimo (neckline).
-    SHORT (T&S classico): 3 massimi con la testa piu' alta + chiusura
-    sotto l'ultimo minimo. Ritorna info per il messaggio; NON apre trade."""
+    """Rileva un TESTA E SPALLE completato sull'ultima candela chiusa,
+    con la NECKLINE definita dai DUE MASSIMI INTERNI (T&S rovesciato)
+    o dai due minimi interni (T&S classico).
+
+    T&S ROVESCIATO (LONG) — forma a W:
+      minimo(spalla sx) - MAX(neck1) - minimo piu' basso(TESTA) -
+      MAX(neck2) - minimo(spalla dx), poi chiusura SOPRA la neckline.
+    T&S CLASSICO (SHORT) — forma a M: speculare.
+
+    Condizioni: testa piu' estrema delle spalle, spalle simili tra loro
+    (entro 40%), neckline coerente (i due max/min entro 0.5%), rottura
+    in chiusura oltre il piu' esterno dei due livelli di neckline."""
     i = len(df) - 1
     ts_ita = df.index[i].tz_convert(TZ_ITA)
     if ts_ita.weekday() >= 5:
         return None
     if filtra_sessione and not (ORA_INIZIO_ITA <= ts_ita.hour < ORA_FINE_ITA):
         return None
-    ph, pl = pivot_multipli(df.iloc[:-1], PIVOT_D)   # solo candele chiuse
-    if not ph or not pl:
+
+    seq = _sequenza_estremi(df.iloc[:-1], PIVOT_D)   # solo candele chiuse
+    if len(seq) < 5:
         return None
     chiusura = float(df["Close"].iloc[i])
-    massimo_candela = float(df["High"].iloc[i])
-    minimo_candela = float(df["Low"].iloc[i])
     rsi = float(df["RSI"].iloc[i])
 
-    # LONG — testa e spalle ROVESCIATO: spalla, testa (minimo assoluto), spalla
-    if len(pl) >= 3:
-        s1, testa, s2 = pl[-3], pl[-2], pl[-1]
-        neckline = ph[-1]                 # ultimo massimo confermato
-        if testa < s1 and testa < s2 and chiusura > neckline:
-            gamba_max = max(neckline, massimo_candela)
-            fib = gamba_max - (gamba_max - testa) * FIB_D
-            return {"dir": "LONG", "pattern": "Testa e Spalle rovesciato",
-                    "rotto": neckline, "origine": testa, "spalle": (s1, s2),
-                    "fib886": fib, "rsi": rsi, "ts": df.index[i]}
+    def simili(a, b, tol):
+        return abs(a - b) / max(abs(a), abs(b), 1e-9) < tol
 
-    # SHORT — testa e spalle CLASSICO: spalla, testa (massimo assoluto), spalla
-    if len(ph) >= 3:
-        s1, testa, s2 = ph[-3], ph[-2], ph[-1]
-        neckline = pl[-1]                 # ultimo minimo confermato
-        if testa > s1 and testa > s2 and chiusura < neckline:
-            gamba_min = min(neckline, minimo_candela)
-            fib = gamba_min + (testa - gamba_min) * FIB_D
-            return {"dir": "SHORT", "pattern": "Testa e Spalle",
-                    "rotto": neckline, "origine": testa, "spalle": (s1, s2),
-                    "fib886": fib, "rsi": rsi, "ts": df.index[i]}
+    TOL_NECK = 0.005    # i due punti di neckline entro 0.5%
+    TOL_SPALLE = 0.40   # spalle simili entro 40% della profondita' testa
+
+    # Cerco la forma L-H-L-H-L (W) o H-L-H-L-H (M) tra gli ultimi estremi.
+    # Il prezzo che rompe la neckline puo' aver gia' formato un nuovo
+    # estremo in coda, quindi provo le ultime finestre di 5, non solo
+    # l'ultima in assoluto.
+    for base in (seq[-5:], seq[-6:-1] if len(seq) >= 6 else None):
+        if base is None or len(base) < 5:
+            continue
+        e1, e2, e3, e4, e5 = base
+        tipi = "".join(e[2] for e in base)
+
+        # --- T&S ROVESCIATO (LONG): W ---
+        if tipi == "LHLHL":
+            sp_sx, neck1, testa, neck2, sp_dx = (e[1] for e in base)
+            neckline = max(neck1, neck2)
+            prof = max(neckline - testa, 1e-9)
+            if (testa < sp_sx and testa < sp_dx and
+                    simili(neck1, neck2, TOL_NECK) and
+                    abs(sp_sx - sp_dx) < prof * TOL_SPALLE and
+                    chiusura > neckline):
+                gamba = neckline - testa
+                return {"dir": "LONG", "pattern": "Testa e Spalle rovesciato",
+                        "rotto": neckline, "origine": testa,
+                        "spalle": (sp_sx, sp_dx),
+                        "fib886": neckline - gamba * FIB_D,
+                        "rsi": rsi, "ts": df.index[i]}
+
+        # --- T&S CLASSICO (SHORT): M ---
+        if tipi == "HLHLH":
+            sp_sx, neck1, testa, neck2, sp_dx = (e[1] for e in base)
+            neckline = min(neck1, neck2)
+            prof = max(testa - neckline, 1e-9)
+            if (testa > sp_sx and testa > sp_dx and
+                    simili(neck1, neck2, TOL_NECK) and
+                    abs(sp_sx - sp_dx) < prof * TOL_SPALLE and
+                    chiusura < neckline):
+                gamba = testa - neckline
+                return {"dir": "SHORT", "pattern": "Testa e Spalle",
+                        "rotto": neckline, "origine": testa,
+                        "spalle": (sp_sx, sp_dx),
+                        "fib886": neckline + gamba * FIB_D,
+                        "rsi": rsi, "ts": df.index[i]}
     return None
 
 
