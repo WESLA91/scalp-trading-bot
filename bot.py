@@ -108,7 +108,7 @@ BANKROLL_INIZ  = 1000.0
 # nella realta' (lo spread da solo vale piu' R dello stop). Trade
 # con stop microscopici vengono scartati per TUTTE le strategie.
 SPREAD_TIPICO = {"EUR/USD": 0.00010, "GBP/USD": 0.00015,
-                 "XAU/USD": 0.30, "GBP/JPY": 0.020}
+                 "USD/CAD": 0.00018, "XAU/USD": 0.30, "GBP/JPY": 0.020}
 STOP_MIN_SPREAD = 5.0   # lo stop deve valere almeno 5x lo spread
 
 try:
@@ -231,6 +231,11 @@ def apri_foglio():
             sh.add_worksheet("Bankroll", rows=60, cols=8)
         if "Stato" not in titoli:
             sh.add_worksheet("Stato", rows=2, cols=1)   # backup stato bot
+        if "Segnalazioni" not in titoli:
+            ws = sh.add_worksheet("Segnalazioni", rows=1000, cols=11)
+            ws.append_row(["Data/ora ITA", "Strategia", "Timeframe",
+                           "Asset", "Pattern", "Direzione", "Neckline",
+                           "Testa", "Fib 0.886", "RSI", "Giudizio (tuo)"])
         return sh
     except Exception as e:
         print(f"Google Sheets non disponibile: {e}")
@@ -423,31 +428,8 @@ def ultimi_pivot(df, finestra):
 
 
 # ------------------- SEGNALATORE D / SCALPING (testa e spalle M15) ---------
-def _comprimi(vals, tieni_minimo=True, tol=0.0005):
-    """Fonde pivot consecutivi quasi identici (entro 0.05%): nelle
-    lateralizzazioni si formano doppi pivot che rompono la geometria
-    spalla-testa-spalla. Tiene il valore piu' estremo."""
-    out = []
-    for v in vals:
-        if out and out[-1] != 0 and abs(v - out[-1]) / abs(out[-1]) < tol:
-            out[-1] = min(out[-1], v) if tieni_minimo else max(out[-1], v)
-        else:
-            out.append(v)
-    return out
-
-
-def pivot_multipli(df, finestra):
-    """Liste complete dei massimi e minimi swing confermati (valori),
-    con compressione dei duplicati consecutivi."""
-    h, l = df["High"].values, df["Low"].values
-    ph, pl = [], []
-    for p in range(finestra, len(df) - finestra):
-        lo, hi = p - finestra, p + finestra + 1
-        if h[p] == h[lo:hi].max():
-            ph.append(h[p])
-        if l[p] == l[lo:hi].min():
-            pl.append(l[p])
-    return _comprimi(ph, tieni_minimo=False), _comprimi(pl, tieni_minimo=True)
+# (le vecchie pivot_multipli/_comprimi sono state sostituite da
+#  _sequenza_estremi, che riconosce la forma completa W/M)
 
 
 def h1_a_h4(df_h1):
@@ -518,11 +500,10 @@ def cerca_inversione(nome, df, filtra_sessione=True):
     chiusura = float(df["Close"].iloc[i])
     rsi = float(df["RSI"].iloc[i])
 
-    def simili(a, b, tol):
-        return abs(a - b) / max(abs(a), abs(b), 1e-9) < tol
-
-    TOL_NECK = 0.005    # i due punti di neckline entro 0.5%
+    TOL_NECK = 0.25     # neckline: i due punti entro il 25% della testa
     TOL_SPALLE = 0.40   # spalle simili entro 40% della profondita' testa
+    MIN_PATTERN = 10.0  # profondita' testa >= 10x spread (anti-rumore)
+    sp_min = SPREAD_TIPICO.get(nome, 0) * MIN_PATTERN
 
     # Cerco la forma L-H-L-H-L (W) o H-L-H-L-H (M) tra gli ultimi estremi.
     # Il prezzo che rompe la neckline puo' aver gia' formato un nuovo
@@ -531,41 +512,57 @@ def cerca_inversione(nome, df, filtra_sessione=True):
     for base in (seq[-5:], seq[-6:-1] if len(seq) >= 6 else None):
         if base is None or len(base) < 5:
             continue
-        e1, e2, e3, e4, e5 = base
         tipi = "".join(e[2] for e in base)
 
         # --- T&S ROVESCIATO (LONG): W ---
         if tipi == "LHLHL":
             sp_sx, neck1, testa, neck2, sp_dx = (e[1] for e in base)
             neckline = max(neck1, neck2)
-            prof = max(neckline - testa, 1e-9)
-            if (testa < sp_sx and testa < sp_dx and
-                    simili(neck1, neck2, TOL_NECK) and
-                    abs(sp_sx - sp_dx) < prof * TOL_SPALLE and
-                    chiusura > neckline):
-                gamba = neckline - testa
+            prof = neckline - testa            # profondita' della testa
+            if (prof > sp_min and                              # anti-rumore
+                    testa < sp_sx and testa < sp_dx and
+                    abs(neck1 - neck2) < prof * TOL_NECK and   # neckline coerente
+                    abs(sp_sx - sp_dx) < prof * TOL_SPALLE and # spalle simili
+                    chiusura > neckline):                      # rottura in chiusura
                 return {"dir": "LONG", "pattern": "Testa e Spalle rovesciato",
                         "rotto": neckline, "origine": testa,
                         "spalle": (sp_sx, sp_dx),
-                        "fib886": neckline - gamba * FIB_D,
+                        "fib886": neckline - prof * FIB_D,
                         "rsi": rsi, "ts": df.index[i]}
 
         # --- T&S CLASSICO (SHORT): M ---
         if tipi == "HLHLH":
             sp_sx, neck1, testa, neck2, sp_dx = (e[1] for e in base)
             neckline = min(neck1, neck2)
-            prof = max(testa - neckline, 1e-9)
-            if (testa > sp_sx and testa > sp_dx and
-                    simili(neck1, neck2, TOL_NECK) and
+            prof = testa - neckline
+            if (prof > sp_min and
+                    testa > sp_sx and testa > sp_dx and
+                    abs(neck1 - neck2) < prof * TOL_NECK and
                     abs(sp_sx - sp_dx) < prof * TOL_SPALLE and
                     chiusura < neckline):
-                gamba = testa - neckline
                 return {"dir": "SHORT", "pattern": "Testa e Spalle",
                         "rotto": neckline, "origine": testa,
                         "spalle": (sp_sx, sp_dx),
-                        "fib886": neckline + gamba * FIB_D,
+                        "fib886": neckline + prof * FIB_D,
                         "rsi": rsi, "ts": df.index[i]}
     return None
+
+
+def sheet_logga_segnalazione(sh, strategia, tf, nome, inv):
+    """Registra ogni allerta T&S nella tab Segnalazioni: e' il registro
+    per le statistiche settimanali (colonna 'Giudizio' da compilare a
+    mano: buono/borderline/spazzatura + esito)."""
+    if sh is None:
+        return
+    try:
+        d = dec(nome)
+        sh.worksheet("Segnalazioni").append_row([
+            inv["ts"].tz_convert(TZ_ITA).strftime("%Y-%m-%d %H:%M"),
+            strategia, tf, nome, inv["pattern"], inv["dir"],
+            f"{inv['rotto']:.{d}f}", f"{inv['origine']:.{d}f}",
+            f"{inv['fib886']:.{d}f}", f"{inv['rsi']:.1f}", ""])
+    except Exception as e:
+        print(f"Sheets errore (segnalazioni): {e}")
 
 
 def msg_inversione(nome, inv, strategia="SCALPING", tf="M15", emoji="🎯"):
@@ -1079,6 +1076,7 @@ def ciclo(stato, sh):
                             f"{inv['origine']:.{dec(nome)}f}")
                 if chiave_d not in stato["gia_segnalati"]:
                     manda_messaggio(msg_inversione(nome, inv))
+                    sheet_logga_segnalazione(sh, "SCALPING", "M15", nome, inv)
                     stato["gia_segnalati"].append(chiave_d)
                     salva_stato(stato, sh)
                     print(f"{nome} [SCALPING]: {inv['pattern']} {inv['dir']}")
@@ -1097,6 +1095,8 @@ def ciclo(stato, sh):
                             manda_messaggio(msg_inversione(
                                 nome, inv_b, strategia="THE BOAT",
                                 tf="H4", emoji="⛵"))
+                            sheet_logga_segnalazione(sh, "THE BOAT", "H4",
+                                                     nome, inv_b)
                             stato["gia_segnalati"].append(chiave_b)
                             salva_stato(stato, sh)
                             print(f"{nome} [THE BOAT]: "
@@ -1125,6 +1125,7 @@ def ciclo(stato, sh):
                             f"{inv['origine']:.{dec(nome)}f}")
                 if chiave_d not in stato["gia_segnalati"]:
                     manda_messaggio(msg_inversione(nome, inv))
+                    sheet_logga_segnalazione(sh, "SCALPING", "M15", nome, inv)
                     stato["gia_segnalati"].append(chiave_d)
                     salva_stato(stato, sh)
                     print(f"{nome} [SCALPING]: {inv['pattern']} {inv['dir']}")
@@ -1154,6 +1155,8 @@ def ciclo(stato, sh):
                                     manda_messaggio(msg_inversione(
                                         nome, inv_b, strategia="THE BOAT",
                                         tf="H4", emoji="⛵"))
+                                    sheet_logga_segnalazione(
+                                        sh, "THE BOAT", "H4", nome, inv_b)
                                     stato["gia_segnalati"].append(chiave_b)
                                     salva_stato(stato, sh)
                                     print(f"{nome} [THE BOAT]: "
