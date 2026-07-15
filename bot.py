@@ -12,16 +12,16 @@
 #  /help /winrate /trend /stats /stato /prezzi /bankroll /scan /ping /restart
 #
 #  Ciclo allineato alle chiusure candela M15 (:00 :15 :30 :45, +45s
-#  buffer dati): la C valuta ogni candela M15 chiusa, A e B solo
+#  buffer dati): la E valuta ogni candela M15 chiusa, A e B solo
 #  quando arriva una nuova candela H1 (con retry se Yahoo ritarda).
 #  Gli esiti di TUTTI i segnali sono verificati sui dati M15
 #  (piu' precisi del worst-case su H1). Notifica quando TP1 sposta
 #  lo SL a breakeven. Lo stato ha backup nella tab "Stato" del
 #  foglio Google: sopravvive ai redeploy Railway (filesystem effimero).
 #
-#  Ogni segnale e' etichettato 🅰️ 🅱️ 🅲 cosi' decidi quanto rischiare.
+#  Ogni segnale e' etichettato 🅰️ 🅱️ 🇪 cosi' decidi quanto rischiare.
 #  Il foglio Google traccia esiti e bankroll PER CONFIG e PER ASSET.
-#  ⚠️ La C e' in forward test: rischio minimo finche' non ha storico.
+#  ⚠️ La E e' in forward test: rischio minimo finche' non ha storico.
 #
 #  Extra (solo informativi, non cambiano la strategia):
 #   - Rating tecnico TradingView nel messaggio (se raggiungibile)
@@ -1137,7 +1137,7 @@ def ascolta_comandi(stato, cont):
 def ciclo(stato, sh):
     for nome, ticker in COPPIE.items():
         try:
-            # M15: scaricato SEMPRE (serve per la C e per gli esiti di tutti)
+            # M15: scaricato SEMPRE (serve per la E e per gli esiti di tutti)
             df_m15 = scarica_dati(ticker, "15m")
             if df_m15 is None:
                 print(f"{nome}: dati M15 non disponibili")
@@ -1325,8 +1325,9 @@ def main():
     threading.Thread(target=ascolta_comandi, args=(stato, cont),
                      daemon=True).start()
     manda_messaggio(
-        "🤖 SCALP Bot V15 avviato!\n"
+        "🤖 SCALP Bot V16 avviato!\n"
         f"🅰️ Qualita' H1 (pivot 3, EMA200)  |  🅱️ Diversificazione H1 (pivot 5)\n"
+        f"🇪 London Breakout M15: box asiatico 01-08, breakout 08-12 ITA\n"
         f"🎯 SCALPING (M15) + ⛵ THE BOAT (H4): testa e spalle — valuti tu\n"
         f"📊 Asset: {', '.join(COPPIE)}\n"
         f"🕐 Sessione {ORA_INIZIO_ITA:02d}-{ORA_FINE_ITA} ITA | "
@@ -1335,7 +1336,7 @@ def main():
         f"📌 Segnali aperti ripristinati: {len(stato['segnali'])}\n"
         "💬 Scrivi /help per i comandi"
     )
-    print("Bot V15 avviato.")
+    print("Bot V16 avviato.")
     while True:
         try:
             print(f"\n--- CICLO "
