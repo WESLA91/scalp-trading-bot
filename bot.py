@@ -1,10 +1,11 @@
 # ============================================================
-#  SCALP BOT V15 LIVE — tripla strategia A/B/C in parallelo
+#  SCALP BOT V16 LIVE — strategie A/B/E in parallelo
 #
 #  🅰️ QUALITA'         H1  onde=2 pivot=3 fib=50% RSI 70/30 EMA200=SI
 #  🅱️ DIVERSIFICAZIONE H1  onde=2 pivot=5 fib=50% RSI 70/30 EMA200=NO
-#  🅲  SPERIMENTALE    M15 onde=2 pivot=5 fib=50% RSI 70/30 EMA200=SI
-#  Tutte: TP1=1R (poi SL a entrata), TP2=3R, sessione 07-19 ITA
+#  🇪 LONDON BREAKOUT  M15 range asiatico 01-08 ITA, breakout 08-12,
+#     max 1 trade/giorno per pair (motore autonomo, forward test)
+#  Tutte: TP1=1R (poi SL a entrata), TP2=3R
 #  (orario Europe/Rome: il cambio ora legale/solare e' automatico)
 #
 #  Comandi Telegram (risposta immediata, thread dedicato):
@@ -74,7 +75,26 @@ CONFIGS = {
     "B": {"nome": "Diversificazione", "emoji": "🅱️", "onde": 2, "pivot": 5,
           "fib": 0.50, "rsi_lmax": 70, "rsi_smin": 30, "ema": False,
           "tf": "1h"},
+    # E: LONDON BREAKOUT (progettata da Claude, forward test).
+    #    Logica completamente diversa da A/B: niente pullback, niente
+    #    engulfing. Range asiatico 01-08 ITA -> primo breakout confermato
+    #    tra le 08 e le 12. Max 1 segnale al giorno per pair.
+    "E": {"nome": "London Breakout", "emoji": "🇪", "tf": "15m",
+          "motore": "london"},
 }
+
+# --------- PARAMETRI STRATEGIA E (London Breakout) ---------
+E_ORA_BOX_INIZIO = 1     # il range asiatico parte alle 01:00 ITA
+E_ORA_BOX_FINE   = 8     # e finisce alle 08:00 ITA (esclusa)
+E_ORA_TRADE_FINE = 12    # breakout valido solo tra le 08 e le 12 ITA
+E_MIN_CANDELE    = 16    # candele M15 minime nel box (dati sufficienti)
+E_BUFFER_BOX     = 0.10  # chiusura oltre il livello di almeno 10% del box
+E_BODY_MIN       = 0.50  # corpo candela breakout >= 50% del suo range
+E_RSI_LONG       = 55.0  # momentum a favore: RSI M15 >= 55 per LONG
+E_RSI_SHORT      = 45.0  #                    RSI M15 <= 45 per SHORT
+E_BOX_MIN_MED    = 0.40  # box odierno >= 40% della mediana storica
+E_BOX_MAX_MED    = 2.00  # e <= 200% (notte anomala = niente trade)
+E_STORICO_BOX    = 10    # giorni indietro per calcolare la mediana
 
 # parametri del segnalatore D
 PIVOT_D = 5          # finestra pivot per gli swing su M15
@@ -653,6 +673,122 @@ def cerca_segnale(nome, df, cid):
     return seg
 
 
+# ------------------- STRATEGIA E: LONDON BREAKOUT (M15) -------------------
+# Progettata da Claude come motore indipendente da A/B.
+# Idea: la notte asiatica comprime il prezzo in un range; l'apertura
+# di Londra lo rompe. Si entra sul PRIMO breakout confermato.
+#
+# Regole (tutte obbligatorie):
+#   1. Box = max/min delle candele M15 aperte tra 01:00 e 08:00 ITA
+#   2. Finestra operativa: 08:00-11:59 ITA, solo giorni feriali
+#   3. Sanita' del box: ampiezza tra 40% e 200% della mediana degli
+#      ultimi box giornalieri (notte morta o notte impazzita = skip)
+#   4. Breakout = la candela precedente chiudeva DENTRO il box e
+#      l'ultima chiude OLTRE il livello di almeno il 10% del box
+#   5. Convinzione: corpo della candela >= 50% del suo range,
+#      nella direzione del breakout
+#   6. Momentum: RSI M15 >= 55 (LONG) oppure <= 45 (SHORT)
+#   7. SL = meta' del box | TP1 = 1R (poi SL a breakeven) | TP2 = 3R
+#   8. Massimo UN segnale al giorno per pair (in qualunque direzione)
+
+
+def _box_asiatico(df, giorno_ita):
+    """(hi, lo) delle candele M15 aperte tra 01 e 08 ITA del giorno dato.
+    None se le candele disponibili sono troppo poche."""
+    loc = df.index.tz_convert(TZ_ITA)
+    mask = ((loc.date == giorno_ita)
+            & (loc.hour >= E_ORA_BOX_INIZIO) & (loc.hour < E_ORA_BOX_FINE))
+    sub = df[mask]
+    if len(sub) < E_MIN_CANDELE:
+        return None
+    return float(sub["High"].max()), float(sub["Low"].min())
+
+
+def cerca_segnale_london(nome, df):
+    """Strategia E su dati M15. Ritorna un segnale nello stesso formato
+    di cerca_segnale (stessi esiti, stesso foglio, stessi messaggi)."""
+    i = len(df) - 1
+    ts = df.index[i]
+    ts_ita = ts.tz_convert(TZ_ITA)
+    # la candela di segnale deve APRIRE tra le 08:00 e le 11:59 ITA
+    if ts_ita.weekday() >= 5:
+        return None
+    if not (E_ORA_BOX_FINE <= ts_ita.hour < E_ORA_TRADE_FINE):
+        return None
+
+    box = _box_asiatico(df, ts_ita.date())
+    if box is None:
+        return None
+    box_hi, box_lo = box
+    ampiezza = box_hi - box_lo
+    if ampiezza <= 0:
+        return None
+
+    # sanita': confronto con la mediana dei box dei giorni precedenti
+    storici = []
+    for g in range(1, E_STORICO_BOX + 1):
+        b = _box_asiatico(df, (ts_ita - pd.Timedelta(days=g)).date())
+        if b is not None and b[0] > b[1]:
+            storici.append(b[0] - b[1])
+        if len(storici) >= 5:
+            break
+    if len(storici) < 3:
+        return None                      # storico insufficiente = niente trade
+    mediana = float(np.median(storici))
+    if not (mediana * E_BOX_MIN_MED <= ampiezza <= mediana * E_BOX_MAX_MED):
+        print(f"{nome} [E]: box fuori norma "
+              f"({ampiezza:.{dec(nome)}f} vs mediana {mediana:.{dec(nome)}f})")
+        return None
+
+    o, h, l, c = (float(df[x].iloc[i]) for x in ["Open", "High", "Low", "Close"])
+    c_prec = float(df["Close"].iloc[i - 1])
+    rsi = float(df["RSI"].iloc[i])
+    if np.isnan(rsi):
+        return None
+
+    rng = h - l
+    if rng <= 0:
+        return None
+    corpo_ok = abs(c - o) >= rng * E_BODY_MIN
+    buffer_ = ampiezza * E_BUFFER_BOX
+    mid = box_lo + ampiezza / 2
+
+    seg = None
+    if (c_prec <= box_hi and c > box_hi + buffer_
+            and c > o and corpo_ok and rsi >= E_RSI_LONG):
+        sl = mid
+        if c - sl > 0:
+            seg = {"dir": "LONG", "entrata": c, "sl": sl,
+                   "tp1": c + (c - sl) * TP1_R,
+                   "tp2": c + (c - sl) * TP2_R}
+    elif (c_prec >= box_lo and c < box_lo - buffer_
+            and c < o and corpo_ok and rsi <= E_RSI_SHORT):
+        sl = mid
+        if sl - c > 0:
+            seg = {"dir": "SHORT", "entrata": c, "sl": sl,
+                   "tp1": c - (sl - c) * TP1_R,
+                   "tp2": c - (sl - c) * TP2_R}
+    if seg is None:
+        return None
+
+    # stesso filtro di eseguibilita' delle altre strategie
+    rischio = abs(seg["entrata"] - seg["sl"])
+    if rischio < SPREAD_TIPICO.get(nome, 0) * STOP_MIN_SPREAD:
+        print(f"{nome} [E]: segnale scartato, stop troppo stretto")
+        return None
+
+    seg.update({
+        "asset": nome, "config": "E", "tf": "15m",
+        "apertura": ts.strftime("%Y-%m-%d %H:%M"),
+        # chiave SENZA direzione e SENZA orario: un solo trade E
+        # al giorno per pair, punto.
+        "chiave": f"E_{nome}_{ts_ita.date().isoformat()}",
+        "id": f"E-{nome.replace('/', '')}-{ts.strftime('%Y%m%d-%H%M')}",
+        "sl_corrente": seg["sl"], "fase": "OPEN", "rsi": rsi,
+    })
+    return seg
+
+
 # ------------------- VERIFICA ESITI (worst-case) -------------------
 def verifica_esito(seg, df):
     apertura = pd.Timestamp(seg["apertura"], tz="UTC")
@@ -736,6 +872,8 @@ TESTO_HELP = (
     "/restart — riavvia il bot (torna su in ~20 secondi)\n"
     "━━━━━━━━━━━━━━━\n"
     f"🅰️ Qualita' H1  🅱️ Diversificazione H1 (trade automatici)\n"
+    f"🇪 London Breakout M15: box asiatico 01-08 ITA, primo breakout\n"
+    f"    confermato tra 08 e 12, SL a meta' box, max 1/giorno per pair\n"
     f"🎯 SCALPING (M15) e ⛵ THE BOAT (H4): avvisano quando si completa\n"
     f"    un testa e spalle; l'entrata a 0.886 la valuti TU sul grafico\n"
     f"🕐 Sessione {ORA_INIZIO_ITA:02d}-{ORA_FINE_ITA} ITA | "
@@ -1056,7 +1194,10 @@ def ciclo(stato, sh):
                 if any(s["asset"] == nome and s["config"] == cid
                        for s in stato["segnali"]):
                     continue
-                seg = cerca_segnale(nome, df, cid)
+                if cfg.get("motore") == "london":
+                    seg = cerca_segnale_london(nome, df_m15)
+                else:
+                    seg = cerca_segnale(nome, df, cid)
                 if seg is None or seg["chiave"] in stato["gia_segnalati"]:
                     continue
                 tv = rating_tradingview(nome)
