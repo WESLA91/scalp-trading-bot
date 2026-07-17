@@ -791,28 +791,42 @@ def cerca_segnale_london(nome, df):
 
 # ------------------- VERIFICA ESITI (worst-case) -------------------
 def verifica_esito(seg, df):
+    """Replay COMPLETO della storia del trade a ogni chiamata, con stato
+    LOCALE. Bug fix V16: prima il replay usava fase/sl_corrente persistiti,
+    quindi dopo il TP1 lo SL a breakeven veniva applicato anche alle
+    candele PRECEDENTI al TP1 -> un vecchio retest dell'entrata chiudeva
+    il trade come TP1_BE mentre era ancora in corsa verso TP2."""
     apertura = pd.Timestamp(seg["apertura"], tz="UTC")
     # L'entrata avviene alla CHIUSURA della candela di segnale:
     # si verifica solo il prezzo successivo a quel momento.
     durata = SECONDI_TF.get(seg.get("tf", "1h"), 3600)
     dopo = df[df.index >= apertura + pd.Timedelta(seconds=durata)]
+    fase = "OPEN"
+    sl = seg["sl"]                      # replay: si parte SEMPRE dall'inizio
     for ts, row in dopo.iterrows():
         hi, lo = float(row["High"]), float(row["Low"])
         if seg["dir"] == "LONG":
-            sl_hit, tp1_hit, tp2_hit = (lo <= seg["sl_corrente"],
+            sl_hit, tp1_hit, tp2_hit = (lo <= sl,
                                         hi >= seg["tp1"], hi >= seg["tp2"])
         else:
-            sl_hit, tp1_hit, tp2_hit = (hi >= seg["sl_corrente"],
+            sl_hit, tp1_hit, tp2_hit = (hi >= sl,
                                         lo <= seg["tp1"], lo <= seg["tp2"])
-        if sl_hit:
-            return ("SL" if seg["fase"] == "OPEN" else "TP1_BE", ts)
-        if seg["fase"] == "OPEN" and tp1_hit:
-            seg["fase"] = "RUNNER"
-            seg["sl_corrente"] = seg["entrata"]
+        if fase == "OPEN":
+            if sl_hit:                  # worst-case: SL prima del TP
+                return ("SL", ts)
+            if tp1_hit:
+                fase = "RUNNER"
+                sl = seg["entrata"]     # breakeven SOLO da questa candela in poi
+                # aggiorno il segnale persistito (per la notifica 🟡 e /stato)
+                seg["fase"] = "RUNNER"
+                seg["sl_corrente"] = seg["entrata"]
+                if tp2_hit:
+                    return ("TP2", ts)
+        else:                           # RUNNER: SL ormai a breakeven
+            if sl_hit:
+                return ("TP1_BE", ts)
             if tp2_hit:
                 return ("TP2", ts)
-        elif seg["fase"] == "RUNNER" and tp2_hit:
-            return ("TP2", ts)
     return None
 
 
