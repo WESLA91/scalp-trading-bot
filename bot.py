@@ -1,27 +1,26 @@
 # ============================================================
-#  SCALP BOT V16 LIVE — strategie A/B/E in parallelo
+#  SCALP BOT V15 LIVE — tripla strategia A/B/C in parallelo
 #
 #  🅰️ QUALITA'         H1  onde=2 pivot=3 fib=50% RSI 70/30 EMA200=SI
 #  🅱️ DIVERSIFICAZIONE H1  onde=2 pivot=5 fib=50% RSI 70/30 EMA200=NO
-#  🇪 LONDON BREAKOUT  M15 range asiatico 01-08 ITA, breakout 08-12,
-#     max 1 trade/giorno per pair (motore autonomo, forward test)
-#  Tutte: TP1=1R (poi SL a entrata), TP2=3R
+#  🅲  SPERIMENTALE    M15 onde=2 pivot=5 fib=50% RSI 70/30 EMA200=SI
+#  Tutte: TP1=1R (poi SL a entrata), TP2=3R, sessione 07-19 ITA
 #  (orario Europe/Rome: il cambio ora legale/solare e' automatico)
 #
 #  Comandi Telegram (risposta immediata, thread dedicato):
 #  /help /winrate /trend /stats /stato /prezzi /bankroll /scan /ping /restart
 #
 #  Ciclo allineato alle chiusure candela M15 (:00 :15 :30 :45, +45s
-#  buffer dati): la E valuta ogni candela M15 chiusa, A e B solo
+#  buffer dati): la C valuta ogni candela M15 chiusa, A e B solo
 #  quando arriva una nuova candela H1 (con retry se Yahoo ritarda).
 #  Gli esiti di TUTTI i segnali sono verificati sui dati M15
 #  (piu' precisi del worst-case su H1). Notifica quando TP1 sposta
 #  lo SL a breakeven. Lo stato ha backup nella tab "Stato" del
 #  foglio Google: sopravvive ai redeploy Railway (filesystem effimero).
 #
-#  Ogni segnale e' etichettato 🅰️ 🅱️ 🇪 cosi' decidi quanto rischiare.
+#  Ogni segnale e' etichettato 🅰️ 🅱️ 🅲 cosi' decidi quanto rischiare.
 #  Il foglio Google traccia esiti e bankroll PER CONFIG e PER ASSET.
-#  ⚠️ La E e' in forward test: rischio minimo finche' non ha storico.
+#  ⚠️ La C e' in forward test: rischio minimo finche' non ha storico.
 #
 #  Extra (solo informativi, non cambiano la strategia):
 #   - Rating tecnico TradingView nel messaggio (se raggiungibile)
@@ -75,26 +74,7 @@ CONFIGS = {
     "B": {"nome": "Diversificazione", "emoji": "🅱️", "onde": 2, "pivot": 5,
           "fib": 0.50, "rsi_lmax": 70, "rsi_smin": 30, "ema": False,
           "tf": "1h"},
-    # E: LONDON BREAKOUT (progettata da Claude, forward test).
-    #    Logica completamente diversa da A/B: niente pullback, niente
-    #    engulfing. Range asiatico 01-08 ITA -> primo breakout confermato
-    #    tra le 08 e le 12. Max 1 segnale al giorno per pair.
-    "E": {"nome": "London Breakout", "emoji": "🇪", "tf": "15m",
-          "motore": "london"},
 }
-
-# --------- PARAMETRI STRATEGIA E (London Breakout) ---------
-E_ORA_BOX_INIZIO = 1     # il range asiatico parte alle 01:00 ITA
-E_ORA_BOX_FINE   = 8     # e finisce alle 08:00 ITA (esclusa)
-E_ORA_TRADE_FINE = 12    # breakout valido solo tra le 08 e le 12 ITA
-E_MIN_CANDELE    = 16    # candele M15 minime nel box (dati sufficienti)
-E_BUFFER_BOX     = 0.10  # chiusura oltre il livello di almeno 10% del box
-E_BODY_MIN       = 0.50  # corpo candela breakout >= 50% del suo range
-E_RSI_LONG       = 55.0  # momentum a favore: RSI M15 >= 55 per LONG
-E_RSI_SHORT      = 45.0  #                    RSI M15 <= 45 per SHORT
-E_BOX_MIN_MED    = 0.40  # box odierno >= 40% della mediana storica
-E_BOX_MAX_MED    = 2.00  # e <= 200% (notte anomala = niente trade)
-E_STORICO_BOX    = 10    # giorni indietro per calcolare la mediana
 
 # parametri del segnalatore D
 PIVOT_D = 5          # finestra pivot per gli swing su M15
@@ -495,18 +475,18 @@ def _sequenza_estremi(df, finestra):
 
 
 def cerca_inversione(nome, df, filtra_sessione=True):
-    """Rileva un TESTA E SPALLE completato sull'ultima candela chiusa,
-    con la NECKLINE definita dai DUE MASSIMI INTERNI (T&S rovesciato)
-    o dai due minimi interni (T&S classico).
+    """Rileva la ROTTURA DI STRUTTURA che anticipa il testa e spalle,
+    sull'ultima candela chiusa. L'allerta arriva QUI, non a pattern
+    completato (sarebbe troppo tardi): la spalla destra si former√†
+    dopo, ed e' li' che Mirko entra col pendente sul ritraccio.
 
-    T&S ROVESCIATO (LONG) — forma a W:
-      minimo(spalla sx) - MAX(neck1) - minimo piu' basso(TESTA) -
-      MAX(neck2) - minimo(spalla dx), poi chiusura SOPRA la neckline.
-    T&S CLASSICO (SHORT) — forma a M: speculare.
+    SHORT (T&S classico in formazione):
+      minimo piu' alto, massimo piu' alto, minimo piu' alto,
+      MASSIMO piu' alto (=TESTA), poi chiusura SOTTO il minimo
+      precedente -> allerta: traccia il Fib dalla testa alla rottura.
+    LONG (T&S rovesciato in formazione): speculare.
 
-    Condizioni: testa piu' estrema delle spalle, spalle simili tra loro
-    (entro 40%), neckline coerente (i due max/min entro 0.5%), rottura
-    in chiusura oltre il piu' esterno dei due livelli di neckline."""
+    Filtro anti-rumore: la gamba testa-rottura >= 10x spread."""
     i = len(df) - 1
     ts_ita = df.index[i].tz_convert(TZ_ITA)
     if ts_ita.weekday() >= 5:
@@ -515,56 +495,48 @@ def cerca_inversione(nome, df, filtra_sessione=True):
         return None
 
     seq = _sequenza_estremi(df.iloc[:-1], PIVOT_D)   # solo candele chiuse
-    if len(seq) < 5:
+    if len(seq) < 4:
         return None
     chiusura = float(df["Close"].iloc[i])
     rsi = float(df["RSI"].iloc[i])
 
-    TOL_NECK = 0.25     # neckline: i due punti entro il 25% della testa
-    TOL_SPALLE = 0.40   # spalle simili entro 40% della profondita' testa
-    MIN_PATTERN = 10.0  # profondita' testa >= 10x spread (anti-rumore)
+    MIN_PATTERN = 10.0    # gamba testa-rottura >= 10x spread (anti-rumore)
     sp_min = SPREAD_TIPICO.get(nome, 0) * MIN_PATTERN
 
-    # Cerco la forma L-H-L-H-L (W) o H-L-H-L-H (M) tra gli ultimi estremi.
-    # Il prezzo che rompe la neckline puo' aver gia' formato un nuovo
-    # estremo in coda, quindi provo le ultime finestre di 5, non solo
-    # l'ultima in assoluto.
-    for base in (seq[-5:], seq[-6:-1] if len(seq) >= 6 else None):
-        if base is None or len(base) < 5:
+    # La rottura puo' aver gia' generato un estremo in coda: provo le
+    # ultime due finestre di 4 estremi.
+    for base in (seq[-4:], seq[-5:-1] if len(seq) >= 5 else None):
+        if base is None or len(base) < 4:
             continue
         tipi = "".join(e[2] for e in base)
 
-        # --- T&S ROVESCIATO (LONG): W ---
-        if tipi == "LHLHL":
-            sp_sx, neck1, testa, neck2, sp_dx = (e[1] for e in base)
-            neckline = max(neck1, neck2)
-            prof = neckline - testa            # profondita' della testa
-            if (prof > sp_min and                              # anti-rumore
-                    testa < sp_sx and testa < sp_dx and
-                    abs(neck1 - neck2) < prof * TOL_NECK and   # neckline coerente
-                    abs(sp_sx - sp_dx) < prof * TOL_SPALLE and # spalle simili
-                    chiusura > neckline):                      # rottura in chiusura
-                return {"dir": "LONG", "pattern": "Testa e Spalle rovesciato",
-                        "rotto": neckline, "origine": testa,
-                        "spalle": (sp_sx, sp_dx),
-                        "fib886": neckline - prof * FIB_D,
-                        "rsi": rsi, "ts": df.index[i]}
+        # --- SHORT: struttura rialzista L-H-L-H rotta al ribasso ---
+        # base = [minimo, massimo, minimo piu' alto, MASSIMO piu' alto]
+        if tipi == "LHLH":
+            l1, h1, l2, testa = (e[1] for e in base)
+            if (l2 > l1 and testa > h1          # minimi e massimi crescenti
+                    and chiusura < l2):          # rottura del minimo precedente
+                gamba = testa - l2
+                if gamba > sp_min:
+                    return {"dir": "SHORT",
+                            "pattern": "Testa e Spalle in formazione",
+                            "rotto": l2, "origine": testa,
+                            "fib886": l2 + gamba * FIB_D,
+                            "rsi": rsi, "ts": df.index[i]}
 
-        # --- T&S CLASSICO (SHORT): M ---
-        if tipi == "HLHLH":
-            sp_sx, neck1, testa, neck2, sp_dx = (e[1] for e in base)
-            neckline = min(neck1, neck2)
-            prof = testa - neckline
-            if (prof > sp_min and
-                    testa > sp_sx and testa > sp_dx and
-                    abs(neck1 - neck2) < prof * TOL_NECK and
-                    abs(sp_sx - sp_dx) < prof * TOL_SPALLE and
-                    chiusura < neckline):
-                return {"dir": "SHORT", "pattern": "Testa e Spalle",
-                        "rotto": neckline, "origine": testa,
-                        "spalle": (sp_sx, sp_dx),
-                        "fib886": neckline + prof * FIB_D,
-                        "rsi": rsi, "ts": df.index[i]}
+        # --- LONG: struttura ribassista H-L-H-L rotta al rialzo ---
+        # base = [massimo, minimo, massimo piu' basso, MINIMO piu' basso]
+        if tipi == "HLHL":
+            h1, l1, h2, testa = (e[1] for e in base)
+            if (h2 < h1 and testa < l1          # massimi e minimi calanti
+                    and chiusura > h2):          # rottura del massimo precedente
+                gamba = h2 - testa
+                if gamba > sp_min:
+                    return {"dir": "LONG",
+                            "pattern": "Testa e Spalle rovesciato in formazione",
+                            "rotto": h2, "origine": testa,
+                            "fib886": h2 - gamba * FIB_D,
+                            "rsi": rsi, "ts": df.index[i]}
     return None
 
 
@@ -588,19 +560,23 @@ def sheet_logga_segnalazione(sh, strategia, tf, nome, inv):
 def msg_inversione(nome, inv, strategia="SCALPING", tf="M15", emoji="🎯"):
     d = dec(nome)
     verso = "📈 possibile LONG" if inv["dir"] == "LONG" else "📉 possibile SHORT"
-    dove_stop = ("sotto la testa" if inv["dir"] == "LONG"
-                 else "sopra la testa")
+    if inv["dir"] == "LONG":
+        cosa_rotto = "Rotto il massimo precedente"
+        dove_stop = "sotto la testa"
+    else:
+        cosa_rotto = "Rotto il minimo precedente"
+        dove_stop = "sopra la testa"
     return (f"{emoji} {strategia} — {nome} ({tf})\n"
-            f"👤 {inv['pattern']} completato!\n"
+            f"👤 {inv['pattern']}!\n"
             f"{verso} (inversione)\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"💥 Neckline rotta (in chiusura): {inv['rotto']:.{d}f}\n"
+            f"💥 {cosa_rotto} (in chiusura): {inv['rotto']:.{d}f}\n"
             f"🗣 Testa ({dove_stop} va lo stop): {inv['origine']:.{d}f}\n"
-            f"💪 Spalle: {inv['spalle'][0]:.{d}f} | {inv['spalle'][1]:.{d}f}\n"
             f"📐 Fib 0.886 di riferimento: {inv['fib886']:.{d}f}\n"
             f"📊 RSI {tf}: {inv['rsi']:.1f}\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"👉 Apri il grafico, traccia il fibo e valuta il pendente.\n"
+            f"👉 Traccia il fibo dalla testa alla rottura e metti il\n"
+            f"    pendente sul ritraccio: la spalla destra e' l'entrata.\n"
             f"⚠️ Se fa nuovi estremi, ritraccia il fibo: il livello si aggiorna.\n"
             f"🕐 Candela {tf} "
             f"{inv['ts'].tz_convert(TZ_ITA).strftime('%d/%m %H:%M')}")
@@ -673,160 +649,30 @@ def cerca_segnale(nome, df, cid):
     return seg
 
 
-# ------------------- STRATEGIA E: LONDON BREAKOUT (M15) -------------------
-# Progettata da Claude come motore indipendente da A/B.
-# Idea: la notte asiatica comprime il prezzo in un range; l'apertura
-# di Londra lo rompe. Si entra sul PRIMO breakout confermato.
-#
-# Regole (tutte obbligatorie):
-#   1. Box = max/min delle candele M15 aperte tra 01:00 e 08:00 ITA
-#   2. Finestra operativa: 08:00-11:59 ITA, solo giorni feriali
-#   3. Sanita' del box: ampiezza tra 40% e 200% della mediana degli
-#      ultimi box giornalieri (notte morta o notte impazzita = skip)
-#   4. Breakout = la candela precedente chiudeva DENTRO il box e
-#      l'ultima chiude OLTRE il livello di almeno il 10% del box
-#   5. Convinzione: corpo della candela >= 50% del suo range,
-#      nella direzione del breakout
-#   6. Momentum: RSI M15 >= 55 (LONG) oppure <= 45 (SHORT)
-#   7. SL = meta' del box | TP1 = 1R (poi SL a breakeven) | TP2 = 3R
-#   8. Massimo UN segnale al giorno per pair (in qualunque direzione)
-
-
-def _box_asiatico(df, giorno_ita):
-    """(hi, lo) delle candele M15 aperte tra 01 e 08 ITA del giorno dato.
-    None se le candele disponibili sono troppo poche."""
-    loc = df.index.tz_convert(TZ_ITA)
-    mask = ((loc.date == giorno_ita)
-            & (loc.hour >= E_ORA_BOX_INIZIO) & (loc.hour < E_ORA_BOX_FINE))
-    sub = df[mask]
-    if len(sub) < E_MIN_CANDELE:
-        return None
-    return float(sub["High"].max()), float(sub["Low"].min())
-
-
-def cerca_segnale_london(nome, df):
-    """Strategia E su dati M15. Ritorna un segnale nello stesso formato
-    di cerca_segnale (stessi esiti, stesso foglio, stessi messaggi)."""
-    i = len(df) - 1
-    ts = df.index[i]
-    ts_ita = ts.tz_convert(TZ_ITA)
-    # la candela di segnale deve APRIRE tra le 08:00 e le 11:59 ITA
-    if ts_ita.weekday() >= 5:
-        return None
-    if not (E_ORA_BOX_FINE <= ts_ita.hour < E_ORA_TRADE_FINE):
-        return None
-
-    box = _box_asiatico(df, ts_ita.date())
-    if box is None:
-        return None
-    box_hi, box_lo = box
-    ampiezza = box_hi - box_lo
-    if ampiezza <= 0:
-        return None
-
-    # sanita': confronto con la mediana dei box dei giorni precedenti
-    storici = []
-    for g in range(1, E_STORICO_BOX + 1):
-        b = _box_asiatico(df, (ts_ita - pd.Timedelta(days=g)).date())
-        if b is not None and b[0] > b[1]:
-            storici.append(b[0] - b[1])
-        if len(storici) >= 5:
-            break
-    if len(storici) < 3:
-        return None                      # storico insufficiente = niente trade
-    mediana = float(np.median(storici))
-    if not (mediana * E_BOX_MIN_MED <= ampiezza <= mediana * E_BOX_MAX_MED):
-        print(f"{nome} [E]: box fuori norma "
-              f"({ampiezza:.{dec(nome)}f} vs mediana {mediana:.{dec(nome)}f})")
-        return None
-
-    o, h, l, c = (float(df[x].iloc[i]) for x in ["Open", "High", "Low", "Close"])
-    c_prec = float(df["Close"].iloc[i - 1])
-    rsi = float(df["RSI"].iloc[i])
-    if np.isnan(rsi):
-        return None
-
-    rng = h - l
-    if rng <= 0:
-        return None
-    corpo_ok = abs(c - o) >= rng * E_BODY_MIN
-    buffer_ = ampiezza * E_BUFFER_BOX
-    mid = box_lo + ampiezza / 2
-
-    seg = None
-    if (c_prec <= box_hi and c > box_hi + buffer_
-            and c > o and corpo_ok and rsi >= E_RSI_LONG):
-        sl = mid
-        if c - sl > 0:
-            seg = {"dir": "LONG", "entrata": c, "sl": sl,
-                   "tp1": c + (c - sl) * TP1_R,
-                   "tp2": c + (c - sl) * TP2_R}
-    elif (c_prec >= box_lo and c < box_lo - buffer_
-            and c < o and corpo_ok and rsi <= E_RSI_SHORT):
-        sl = mid
-        if sl - c > 0:
-            seg = {"dir": "SHORT", "entrata": c, "sl": sl,
-                   "tp1": c - (sl - c) * TP1_R,
-                   "tp2": c - (sl - c) * TP2_R}
-    if seg is None:
-        return None
-
-    # stesso filtro di eseguibilita' delle altre strategie
-    rischio = abs(seg["entrata"] - seg["sl"])
-    if rischio < SPREAD_TIPICO.get(nome, 0) * STOP_MIN_SPREAD:
-        print(f"{nome} [E]: segnale scartato, stop troppo stretto")
-        return None
-
-    seg.update({
-        "asset": nome, "config": "E", "tf": "15m",
-        "apertura": ts.strftime("%Y-%m-%d %H:%M"),
-        # chiave SENZA direzione e SENZA orario: un solo trade E
-        # al giorno per pair, punto.
-        "chiave": f"E_{nome}_{ts_ita.date().isoformat()}",
-        "id": f"E-{nome.replace('/', '')}-{ts.strftime('%Y%m%d-%H%M')}",
-        "sl_corrente": seg["sl"], "fase": "OPEN", "rsi": rsi,
-    })
-    return seg
-
-
 # ------------------- VERIFICA ESITI (worst-case) -------------------
 def verifica_esito(seg, df):
-    """Replay COMPLETO della storia del trade a ogni chiamata, con stato
-    LOCALE. Bug fix V16: prima il replay usava fase/sl_corrente persistiti,
-    quindi dopo il TP1 lo SL a breakeven veniva applicato anche alle
-    candele PRECEDENTI al TP1 -> un vecchio retest dell'entrata chiudeva
-    il trade come TP1_BE mentre era ancora in corsa verso TP2."""
     apertura = pd.Timestamp(seg["apertura"], tz="UTC")
     # L'entrata avviene alla CHIUSURA della candela di segnale:
     # si verifica solo il prezzo successivo a quel momento.
     durata = SECONDI_TF.get(seg.get("tf", "1h"), 3600)
     dopo = df[df.index >= apertura + pd.Timedelta(seconds=durata)]
-    fase = "OPEN"
-    sl = seg["sl"]                      # replay: si parte SEMPRE dall'inizio
     for ts, row in dopo.iterrows():
         hi, lo = float(row["High"]), float(row["Low"])
         if seg["dir"] == "LONG":
-            sl_hit, tp1_hit, tp2_hit = (lo <= sl,
+            sl_hit, tp1_hit, tp2_hit = (lo <= seg["sl_corrente"],
                                         hi >= seg["tp1"], hi >= seg["tp2"])
         else:
-            sl_hit, tp1_hit, tp2_hit = (hi >= sl,
+            sl_hit, tp1_hit, tp2_hit = (hi >= seg["sl_corrente"],
                                         lo <= seg["tp1"], lo <= seg["tp2"])
-        if fase == "OPEN":
-            if sl_hit:                  # worst-case: SL prima del TP
-                return ("SL", ts)
-            if tp1_hit:
-                fase = "RUNNER"
-                sl = seg["entrata"]     # breakeven SOLO da questa candela in poi
-                # aggiorno il segnale persistito (per la notifica 🟡 e /stato)
-                seg["fase"] = "RUNNER"
-                seg["sl_corrente"] = seg["entrata"]
-                if tp2_hit:
-                    return ("TP2", ts)
-        else:                           # RUNNER: SL ormai a breakeven
-            if sl_hit:
-                return ("TP1_BE", ts)
+        if sl_hit:
+            return ("SL" if seg["fase"] == "OPEN" else "TP1_BE", ts)
+        if seg["fase"] == "OPEN" and tp1_hit:
+            seg["fase"] = "RUNNER"
+            seg["sl_corrente"] = seg["entrata"]
             if tp2_hit:
                 return ("TP2", ts)
+        elif seg["fase"] == "RUNNER" and tp2_hit:
+            return ("TP2", ts)
     return None
 
 
@@ -886,8 +732,6 @@ TESTO_HELP = (
     "/restart — riavvia il bot (torna su in ~20 secondi)\n"
     "━━━━━━━━━━━━━━━\n"
     f"🅰️ Qualita' H1  🅱️ Diversificazione H1 (trade automatici)\n"
-    f"🇪 London Breakout M15: box asiatico 01-08 ITA, primo breakout\n"
-    f"    confermato tra 08 e 12, SL a meta' box, max 1/giorno per pair\n"
     f"🎯 SCALPING (M15) e ⛵ THE BOAT (H4): avvisano quando si completa\n"
     f"    un testa e spalle; l'entrata a 0.886 la valuti TU sul grafico\n"
     f"🕐 Sessione {ORA_INIZIO_ITA:02d}-{ORA_FINE_ITA} ITA | "
@@ -1151,7 +995,7 @@ def ascolta_comandi(stato, cont):
 def ciclo(stato, sh):
     for nome, ticker in COPPIE.items():
         try:
-            # M15: scaricato SEMPRE (serve per la E e per gli esiti di tutti)
+            # M15: scaricato SEMPRE (serve per la C e per gli esiti di tutti)
             df_m15 = scarica_dati(ticker, "15m")
             if df_m15 is None:
                 print(f"{nome}: dati M15 non disponibili")
@@ -1208,10 +1052,7 @@ def ciclo(stato, sh):
                 if any(s["asset"] == nome and s["config"] == cid
                        for s in stato["segnali"]):
                     continue
-                if cfg.get("motore") == "london":
-                    seg = cerca_segnale_london(nome, df_m15)
-                else:
-                    seg = cerca_segnale(nome, df, cid)
+                seg = cerca_segnale(nome, df, cid)
                 if seg is None or seg["chiave"] in stato["gia_segnalati"]:
                     continue
                 tv = rating_tradingview(nome)
@@ -1339,9 +1180,8 @@ def main():
     threading.Thread(target=ascolta_comandi, args=(stato, cont),
                      daemon=True).start()
     manda_messaggio(
-        "🤖 SCALP Bot V16 avviato!\n"
+        "🤖 SCALP Bot V15 avviato!\n"
         f"🅰️ Qualita' H1 (pivot 3, EMA200)  |  🅱️ Diversificazione H1 (pivot 5)\n"
-        f"🇪 London Breakout M15: box asiatico 01-08, breakout 08-12 ITA\n"
         f"🎯 SCALPING (M15) + ⛵ THE BOAT (H4): testa e spalle — valuti tu\n"
         f"📊 Asset: {', '.join(COPPIE)}\n"
         f"🕐 Sessione {ORA_INIZIO_ITA:02d}-{ORA_FINE_ITA} ITA | "
@@ -1350,7 +1190,7 @@ def main():
         f"📌 Segnali aperti ripristinati: {len(stato['segnali'])}\n"
         "💬 Scrivi /help per i comandi"
     )
-    print("Bot V16 avviato.")
+    print("Bot V15 avviato.")
     while True:
         try:
             print(f"\n--- CICLO "
