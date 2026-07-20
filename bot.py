@@ -557,27 +557,52 @@ def sheet_logga_segnalazione(sh, strategia, tf, nome, inv):
         print(f"Sheets errore (segnalazioni): {e}")
 
 
+def pip_size(nome):
+    if "JPY" in nome:
+        return 0.01
+    if "XAU" in nome:
+        return 0.1
+    return 0.0001
+
+
 def msg_inversione(nome, inv, strategia="SCALPING", tf="M15", emoji="🎯"):
     d = dec(nome)
+    pp = pip_size(nome)
     verso = "📈 possibile LONG" if inv["dir"] == "LONG" else "📉 possibile SHORT"
+    entrata = inv["fib886"]
+    sl = inv["origine"]                      # la testa (aggiungi il tuo buffer)
+    rischio = abs(entrata - sl)
     if inv["dir"] == "LONG":
         cosa_rotto = "Rotto il massimo precedente"
-        dove_stop = "sotto la testa"
+        tp1 = entrata + rischio * 3
+        tp2 = entrata + rischio * 5
+        tp3 = entrata + rischio * 8
+        tipo_ordine = "BUY LIMIT"
     else:
         cosa_rotto = "Rotto il minimo precedente"
-        dove_stop = "sopra la testa"
-    return (f"{emoji} {strategia} — {nome} ({tf})\n"
+        tp1 = entrata - rischio * 3
+        tp2 = entrata - rischio * 5
+        tp3 = entrata - rischio * 8
+        tipo_ordine = "SELL LIMIT"
+    pip_stop = rischio / pp
+    return (f"{emoji}{emoji}  {strategia.upper()} ({tf})  {emoji}{emoji}\n"
+            f"{'═' * 22}\n"
+            f"💱 {nome}\n"
             f"👤 {inv['pattern']}!\n"
             f"{verso} (inversione)\n"
             f"━━━━━━━━━━━━━━━\n"
             f"💥 {cosa_rotto} (in chiusura): {inv['rotto']:.{d}f}\n"
-            f"🗣 Testa ({dove_stop} va lo stop): {inv['origine']:.{d}f}\n"
-            f"📐 Fib 0.886 di riferimento: {inv['fib886']:.{d}f}\n"
+            f"🗣 Testa: {inv['origine']:.{d}f}\n"
+            f"━━━ SCHEDA ORDINE ━━━\n"
+            f"📌 {tipo_ordine} (0.886): {entrata:.{d}f}\n"
+            f"🔴 SL oltre la testa: {sl:.{d}f}  ({pip_stop:.0f} pip di stop)\n"
+            f"🎯 TP1 (1:3): {tp1:.{d}f}  → poi SL a breakeven\n"
+            f"🎯 TP2 (1:5): {tp2:.{d}f}\n"
+            f"🎯 TP3 (1:8): {tp3:.{d}f}\n"
             f"📊 RSI {tf}: {inv['rsi']:.1f}\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"👉 Traccia il fibo dalla testa alla rottura e metti il\n"
-            f"    pendente sul ritraccio: la spalla destra e' l'entrata.\n"
-            f"⚠️ Se fa nuovi estremi, ritraccia il fibo: il livello si aggiorna.\n"
+            f"👉 La spalla destra e' l'entrata: il pendente ti viene a prendere.\n"
+            f"⚠️ Se fa nuovi estremi, ritraccia il fibo: i livelli si aggiornano.\n"
             f"🕐 Candela {tf} "
             f"{inv['ts'].tz_convert(TZ_ITA).strftime('%d/%m %H:%M')}")
 
