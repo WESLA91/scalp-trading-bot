@@ -78,7 +78,8 @@ CONFIGS = {
 
 # parametri del segnalatore D
 PIVOT_D = 5          # finestra pivot per gli swing su M15
-FIB_D   = 0.886      # livello di riferimento per il pendente
+FIB_D    = 0.886     # entrata aggressiva (ritraccio profondo)
+FIB_CONS = 0.618     # entrata conservativa (primo pendente)
 
 # Coppie dei SEGNALATORI (SCALPING M15 + THE BOAT H4).
 # A/B restano trade automatici SOLO sui 4 asset storici di COPPIE.
@@ -176,11 +177,12 @@ def carica_stato(sh=None):
                 stato = json.loads(val)
                 stato.setdefault("segnali", [])
                 stato.setdefault("gia_segnalati", [])
+                stato.setdefault("setup_d", [])
                 print("Stato ripristinato dal backup su Google Sheets.")
                 return stato
         except Exception as e:
             print(f"Nessun backup stato su Sheets: {e}")
-    return {"segnali": [], "gia_segnalati": []}
+    return {"segnali": [], "gia_segnalati": [], "setup_d": []}
 
 
 def salva_stato(stato, sh=None):
@@ -521,6 +523,7 @@ def cerca_inversione(nome, df, filtra_sessione=True):
                     return {"dir": "SHORT",
                             "pattern": "Testa e Spalle in formazione",
                             "rotto": l2, "origine": testa,
+                            "fib618": l2 + gamba * FIB_CONS,
                             "fib886": l2 + gamba * FIB_D,
                             "rsi": rsi, "ts": df.index[i]}
 
@@ -535,6 +538,7 @@ def cerca_inversione(nome, df, filtra_sessione=True):
                     return {"dir": "LONG",
                             "pattern": "Testa e Spalle rovesciato in formazione",
                             "rotto": h2, "origine": testa,
+                            "fib618": h2 - gamba * FIB_CONS,
                             "fib886": h2 - gamba * FIB_D,
                             "rsi": rsi, "ts": df.index[i]}
     return None
@@ -565,26 +569,126 @@ def pip_size(nome):
     return 0.0001
 
 
+def registra_setup(stato, nome, tf, strategia, emoji, inv):
+    """Salva i due pendenti (0.618 e 0.886) in attesa di essere presi.
+    Il tracking successivo manda gli aggiornamenti: attivo, TP, SL."""
+    sl = inv["origine"]
+    base_id = (f"{strategia[:4]}-{nome.replace('/', '')}-"
+               f"{inv['ts'].tz_convert(TZ_ITA).strftime('%d%m-%H%M')}")
+    for etichetta, liv in (("A 0.618", inv["fib618"]),
+                           ("B 0.886", inv["fib886"])):
+        r = abs(liv - sl)
+        if r <= 0:
+            continue
+        segno = 1 if inv["dir"] == "LONG" else -1
+        stato.setdefault("setup_d", []).append({
+            "id": f"{base_id}-{etichetta[0]}", "asset": nome, "tf": tf,
+            "strategia": strategia, "emoji": emoji, "dir": inv["dir"],
+            "etichetta": etichetta, "entrata": liv, "sl": sl,
+            "sl_corr": sl, "rischio": r,
+            "tp1": liv + segno * r * 3, "tp2": liv + segno * r * 5,
+            "tp3": liv + segno * r * 8,
+            "fase": "PENDENTE", "ts": inv["ts"].isoformat()})
+
+
+def aggiorna_setup_d(stato, nome, df, sh):
+    """Controlla i pendenti/posizioni aperte di questo asset sull'ultima
+    candela chiusa e manda gli aggiornamenti. Ritorna nulla."""
+    if not stato.get("setup_d"):
+        return
+    hi = float(df["High"].iloc[-1])
+    lo = float(df["Low"].iloc[-1])
+    ora = datetime.now(timezone.utc)
+    for s in list(stato["setup_d"]):
+        if s["asset"] != nome:
+            continue
+        d = dec(nome)
+        lungo = s["dir"] == "LONG"
+        testo = None
+
+        if s["fase"] == "PENDENTE":
+            # invalidazione: prezzo oltre la testa prima del riempimento
+            if (lungo and lo <= s["sl"]) or (not lungo and hi >= s["sl"]):
+                testo = (f"❌ {s['emoji']} ANALISI INVALIDATA — {nome} "
+                         f"({s['etichetta']})\n"
+                         f"Il prezzo ha rotto la testa prima dell'entrata.\n"
+                         f"🆔 {s['id']}")
+                stato["setup_d"].remove(s)
+            # riempimento del pendente
+            elif (lungo and lo <= s["entrata"]) or \
+                 (not lungo and hi >= s["entrata"]):
+                s["fase"] = "APERTA"
+                testo = (f"✅ {s['emoji']} PENDENTE ATTIVO — {nome} "
+                         f"{s['dir']} ({s['etichetta']})\n"
+                         f"Sei dentro a {s['entrata']:.{d}f}\n"
+                         f"🔴 SL {s['sl']:.{d}f}  "
+                         f"({s['rischio']/pip_size(nome):.0f} pip)\n"
+                         f"🎯 TP1 {s['tp1']:.{d}f}\n🆔 {s['id']}")
+            # scadenza: 48h senza riempimento
+            elif (ora - pd.Timestamp(s["ts"]).to_pydatetime()).total_seconds() \
+                    > (48 if s["tf"] == "M15" else 168) * 3600:
+                stato["setup_d"].remove(s)
+                print(f"{nome}: setup {s['id']} scaduto (48h)")
+
+        elif s["fase"] in ("APERTA", "RUNNER", "RUNNER2"):
+            colpito_sl = (lo <= s["sl_corr"]) if lungo else (hi >= s["sl_corr"])
+            if colpito_sl:
+                if s["fase"] == "APERTA":
+                    testo = (f"❌ {s['emoji']} STOP LOSS — {nome} {s['dir']} "
+                             f"({s['etichetta']})\nEsito: -1R\n🆔 {s['id']}")
+                else:
+                    testo = (f"⚪ {s['emoji']} CHIUSO A BREAKEVEN — {nome} "
+                             f"({s['etichetta']})\n"
+                             f"TP1 preso, resto chiuso in pari.\n🆔 {s['id']}")
+                stato["setup_d"].remove(s)
+            else:
+                tp3 = (hi >= s["tp3"]) if lungo else (lo <= s["tp3"])
+                tp2 = (hi >= s["tp2"]) if lungo else (lo <= s["tp2"])
+                tp1 = (hi >= s["tp1"]) if lungo else (lo <= s["tp1"])
+                if tp3:
+                    testo = (f"🏆 {s['emoji']} TP3 RAGGIUNTO (1:8) — {nome} "
+                             f"({s['etichetta']})\n"
+                             f"{s['tp3']:.{d}f} — trade completato!\n"
+                             f"🆔 {s['id']}")
+                    stato["setup_d"].remove(s)
+                elif tp2 and s["fase"] != "RUNNER2":
+                    s["fase"] = "RUNNER2"
+                    testo = (f"🟢 {s['emoji']} TP2 RAGGIUNTO (1:5) — {nome} "
+                             f"({s['etichetta']})\n"
+                             f"{s['tp2']:.{d}f} — resta TP3 a "
+                             f"{s['tp3']:.{d}f}\n🆔 {s['id']}")
+                elif tp1 and s["fase"] == "APERTA":
+                    s["fase"] = "RUNNER"
+                    s["sl_corr"] = s["entrata"]
+                    testo = (f"🟡 {s['emoji']} TP1 RAGGIUNTO (1:3) — {nome} "
+                             f"({s['etichetta']})\n"
+                             f"{s['tp1']:.{d}f} — SPOSTA LO SL A BREAKEVEN "
+                             f"({s['entrata']:.{d}f})\n🆔 {s['id']}")
+
+        if testo:
+            manda_messaggio(testo)
+            salva_stato(stato, sh)
+            print(f"{nome} [{s['strategia']}]: {s['fase']} {s['id']}")
+
+
 def msg_inversione(nome, inv, strategia="SCALPING", tf="M15", emoji="🎯"):
     d = dec(nome)
     pp = pip_size(nome)
     verso = "📈 possibile LONG" if inv["dir"] == "LONG" else "📉 possibile SHORT"
-    entrata = inv["fib886"]
     sl = inv["origine"]                      # la testa (aggiungi il tuo buffer)
-    rischio = abs(entrata - sl)
-    if inv["dir"] == "LONG":
-        cosa_rotto = "Rotto il massimo precedente"
-        tp1 = entrata + rischio * 3
-        tp2 = entrata + rischio * 5
-        tp3 = entrata + rischio * 8
-        tipo_ordine = "BUY LIMIT"
-    else:
-        cosa_rotto = "Rotto il minimo precedente"
-        tp1 = entrata - rischio * 3
-        tp2 = entrata - rischio * 5
-        tp3 = entrata - rischio * 8
-        tipo_ordine = "SELL LIMIT"
-    pip_stop = rischio / pp
+    e1, e2 = inv["fib618"], inv["fib886"]    # conservativa, aggressiva
+    r1, r2 = abs(e1 - sl), abs(e2 - sl)
+    segno = 1 if inv["dir"] == "LONG" else -1
+    tipo_ordine = "BUY LIMIT" if inv["dir"] == "LONG" else "SELL LIMIT"
+    cosa_rotto = ("Rotto il massimo precedente" if inv["dir"] == "LONG"
+                  else "Rotto il minimo precedente")
+
+    def blocco(nome_e, e, r):
+        return (f"📌 {nome_e}: {e:.{d}f}   ({r/pp:.0f} pip di stop)\n"
+                f"    🎯 TP1 1:3 {e + segno*r*3:.{d}f}  → SL a BE\n"
+                f"    🎯 TP2 1:5 {e + segno*r*5:.{d}f}\n"
+                f"    🎯 TP3 1:8 {e + segno*r*8:.{d}f}\n")
+
     return (f"{emoji}{emoji}  {strategia.upper()} ({tf})  {emoji}{emoji}\n"
             f"{'═' * 22}\n"
             f"💱 {nome}\n"
@@ -593,15 +697,14 @@ def msg_inversione(nome, inv, strategia="SCALPING", tf="M15", emoji="🎯"):
             f"━━━━━━━━━━━━━━━\n"
             f"💥 {cosa_rotto} (in chiusura): {inv['rotto']:.{d}f}\n"
             f"🗣 Testa: {inv['origine']:.{d}f}\n"
-            f"━━━ SCHEDA ORDINE ━━━\n"
-            f"📌 {tipo_ordine} (0.886): {entrata:.{d}f}\n"
-            f"🔴 SL oltre la testa: {sl:.{d}f}  ({pip_stop:.0f} pip di stop)\n"
-            f"🎯 TP1 (1:3): {tp1:.{d}f}  → poi SL a breakeven\n"
-            f"🎯 TP2 (1:5): {tp2:.{d}f}\n"
-            f"🎯 TP3 (1:8): {tp3:.{d}f}\n"
+            f"🔴 SL oltre la testa: {sl:.{d}f}\n"
+            f"━━━ 2 ENTRATE ({tipo_ordine}) ━━━\n"
+            f"{blocco('A) 0.618 conservativa', e1, r1)}"
+            f"{blocco('B) 0.886 aggressiva', e2, r2)}"
             f"📊 RSI {tf}: {inv['rsi']:.1f}\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"👉 La spalla destra e' l'entrata: il pendente ti viene a prendere.\n"
+            f"💡 Meta' size su A, meta' su B: rischio diviso.\n"
+            f"👉 La spalla destra e' l'entrata: i pendenti ti vengono a prendere.\n"
             f"⚠️ Se fa nuovi estremi, ritraccia il fibo: i livelli si aggiornano.\n"
             f"🕐 Candela {tf} "
             f"{inv['ts'].tz_convert(TZ_ITA).strftime('%d/%m %H:%M')}")
@@ -766,9 +869,12 @@ TESTO_HELP = (
 
 def cmd_stato(stato):
     aperti = list(stato.get("segnali", []))   # copia: letta da altro thread
-    if not aperti:
-        return "📭 Nessun segnale aperto al momento."
-    righe = [f"📌 SEGNALI APERTI: {len(aperti)}", "━━━━━━━━━━━━━━━"]
+    setup = list(stato.get("setup_d", []))
+    if not aperti and not setup:
+        return "📭 Nessun segnale o setup aperto al momento."
+    righe = []
+    if aperti:
+        righe += [f"📌 SEGNALI APERTI: {len(aperti)}", "━━━━━━━━━━━━━━━"]
     for s in aperti:
         cfg = CONFIGS.get(s["config"], {})
         d = dec(s["asset"])
@@ -777,6 +883,20 @@ def cmd_stato(stato):
                      f"   entrata {s['entrata']:.{d}f} | "
                      f"SL {s['sl_corrente']:.{d}f} | TP2 {s['tp2']:.{d}f}\n"
                      f"   🆔 {s['id']}")
+    if setup:
+        righe.append("")
+        righe.append(f"🎯⛵ SETUP T&S: {len(setup)}")
+        righe.append("━━━━━━━━━━━━━━━")
+        for s in setup:
+            d = dec(s["asset"])
+            stato_txt = {"PENDENTE": "in attesa", "APERTA": "aperta",
+                         "RUNNER": "TP1 fatto, SL a BE",
+                         "RUNNER2": "TP2 fatto"}.get(s["fase"], s["fase"])
+            righe.append(f"{s['emoji']} {s['asset']} {s['dir']} "
+                         f"[{s['etichetta']}] — {stato_txt}\n"
+                         f"   entrata {s['entrata']:.{d}f} | "
+                         f"SL {s['sl_corr']:.{d}f}\n"
+                         f"   🆔 {s['id']}")
     return "\n".join(righe)
 
 
@@ -1046,6 +1166,9 @@ def ciclo(stato, sh):
                     else:
                         marcatori[nome] = nuova.isoformat()
 
+            # 0) aggiornamenti dei setup SCALPING/BOAT (pendenti e aperti)
+            aggiorna_setup_d(stato, nome, df_m15, sh)
+
             # 1) esiti dei segnali aperti (tutte le config, dati M15:
             #    piu' granulari = worst-case piu' fedele anche per A e B)
             for seg in [s for s in stato["segnali"] if s["asset"] == nome]:
@@ -1098,6 +1221,7 @@ def ciclo(stato, sh):
                 if chiave_d not in stato["gia_segnalati"]:
                     manda_messaggio(msg_inversione(nome, inv))
                     sheet_logga_segnalazione(sh, "SCALPING", "M15", nome, inv)
+                    registra_setup(stato, nome, "M15", "SCALPING", "🎯", inv)
                     stato["gia_segnalati"].append(chiave_d)
                     salva_stato(stato, sh)
                     print(f"{nome} [SCALPING]: {inv['pattern']} {inv['dir']}")
@@ -1118,6 +1242,8 @@ def ciclo(stato, sh):
                                 tf="H4", emoji="⛵"))
                             sheet_logga_segnalazione(sh, "THE BOAT", "H4",
                                                      nome, inv_b)
+                            registra_setup(stato, nome, "H4", "THE BOAT",
+                                           "⛵", inv_b)
                             stato["gia_segnalati"].append(chiave_b)
                             salva_stato(stato, sh)
                             print(f"{nome} [THE BOAT]: "
@@ -1140,6 +1266,7 @@ def ciclo(stato, sh):
             df_m15 = scarica_dati(ticker, "15m")
             if df_m15 is None:
                 continue
+            aggiorna_setup_d(stato, nome, df_m15, sh)
             inv = cerca_inversione(nome, df_m15)
             if inv is not None:
                 chiave_d = (f"D_{nome}_{inv['dir']}_"
@@ -1147,6 +1274,7 @@ def ciclo(stato, sh):
                 if chiave_d not in stato["gia_segnalati"]:
                     manda_messaggio(msg_inversione(nome, inv))
                     sheet_logga_segnalazione(sh, "SCALPING", "M15", nome, inv)
+                    registra_setup(stato, nome, "M15", "SCALPING", "🎯", inv)
                     stato["gia_segnalati"].append(chiave_d)
                     salva_stato(stato, sh)
                     print(f"{nome} [SCALPING]: {inv['pattern']} {inv['dir']}")
@@ -1178,6 +1306,8 @@ def ciclo(stato, sh):
                                         tf="H4", emoji="⛵"))
                                     sheet_logga_segnalazione(
                                         sh, "THE BOAT", "H4", nome, inv_b)
+                                    registra_setup(stato, nome, "H4",
+                                                   "THE BOAT", "⛵", inv_b)
                                     stato["gia_segnalati"].append(chiave_b)
                                     salva_stato(stato, sh)
                                     print(f"{nome} [THE BOAT]: "
